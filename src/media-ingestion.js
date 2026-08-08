@@ -3,6 +3,7 @@ export const IMAGE_MAX_BYTES = 25 * 1024 * 1024;
 export const VIDEO_MAX_BYTES = 1024 * 1024 * 1024;
 export const MULTIPART_PART_BYTES = 16 * 1024 * 1024;
 export const MEDIA_SNIFF_BYTES = 4096;
+export const MAX_ISO_FTYP_BOX_BYTES = 1024;
 
 const MEDIA_TYPES = Object.freeze({
   jpg: Object.freeze({
@@ -555,14 +556,21 @@ export function isTemporaryNotionHostedUrl(url) {
 
 function detectIsoBaseMediaType(bytes) {
   const boxSize = readUint32(bytes, 0);
-  if (boxSize !== 0 && boxSize < 12) return null;
+  if (
+    boxSize === 0 ||
+    boxSize === 1 ||
+    boxSize < 16 ||
+    boxSize > MAX_ISO_FTYP_BOX_BYTES ||
+    boxSize > bytes.length ||
+    (boxSize - 16) % 4 !== 0
+  ) {
+    return null;
+  }
   const majorBrand = ascii(bytes, 8, 4).toLowerCase();
   if (majorBrand === "qt  ") return QUICKTIME_MAJOR_MEDIA_TYPE;
   if (MP4_BRANDS.has(majorBrand)) return MEDIA_TYPES.mp4;
 
-  const availableBoxSize =
-    boxSize === 0 ? bytes.length : Math.min(boxSize, bytes.length);
-  for (let offset = 16; offset + 4 <= availableBoxSize; offset += 4) {
+  for (let offset = 16; offset + 4 <= boxSize; offset += 4) {
     const brand = ascii(bytes, offset, 4).toLowerCase();
     if (brand === "qt  ") return MEDIA_TYPES.mov;
     if (MP4_BRANDS.has(brand)) return MEDIA_TYPES.mp4;

@@ -362,6 +362,52 @@ test("applies qt-major .mp4 compatibility to external HTTPS sources", async () =
   assert.equal(result.format, "MP4");
 });
 
+test("waits for the complete declared ftyp box across source chunks", async () => {
+  const first = QUICKTIME_MAJOR_BYTES.subarray(0, 12);
+  const second = QUICKTIME_MAJOR_BYTES.subarray(12);
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(first);
+      controller.enqueue(second);
+      controller.close();
+    },
+  });
+
+  const result = await ingestSourceToR2(
+    testEnv(new MemoryR2Bucket()),
+    { sourceUrl: "https://assets.example.com/fragmented-quicktime.mp4" },
+    {
+      fetchImpl: async () =>
+        new Response(stream, {
+          status: 200,
+          headers: {
+            "Content-Type": "video/mp4",
+            "Content-Length": String(QUICKTIME_MAJOR_BYTES.byteLength),
+          },
+        }),
+    }
+  );
+
+  assert.equal(result.extension, "mp4");
+  assert.equal(result.contentType, "video/mp4");
+});
+
+test("rejects a truncated source that declares a larger ftyp box", async () => {
+  const truncated = QUICKTIME_MAJOR_BYTES.subarray(0, 12);
+  await assert.rejects(
+    ingestSourceToR2(
+      testEnv(new MemoryR2Bucket()),
+      { sourceUrl: "https://assets.example.com/truncated-quicktime.mp4" },
+      {
+        fetchImpl: async () => sourceResponse(truncated, "video/mp4"),
+      }
+    ),
+    (error) =>
+      error.status === 415 &&
+      error.details.code === "UNSUPPORTED_MEDIA_SIGNATURE"
+  );
+});
+
 test("preserves qt-major MP4 normalization when promotion resumes from staging", async () => {
   const bucket = new MemoryR2Bucket();
   const hash = createHash("sha256")
