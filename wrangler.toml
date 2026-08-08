@@ -1,14 +1,15 @@
 name = "media-assets-worker"
 main = "src/index.js"
 compatibility_date = "2026-08-08"
+compatibility_flags = ["global_fetch_strictly_public"]
 
 [vars]
 MEDIA_ASSETS_DATABASE_ID = "7c86b4f3-1f36-4f82-96d8-1fe87962fcc0"
 MEDIA_ASSETS_DATA_SOURCE_ID = "97d14043-3d6b-46db-959b-d8a8d55feee3"
 POSTS_DATABASE_ID = "3068d902-271f-810e-82e8-f878238d58dd"
 POSTS_DATA_SOURCE_ID = "3068d902-271f-8111-89ac-000bbaa74214"
+R2_PUBLIC_BASE_URL = "https://images.xhs.justlikekatie.com"
 
-# Add after you create/confirm the R2 bucket:
-# [[r2_buckets]]
-# binding = "MEDIA_BUCKET"
-# bucket_name = "your-bucket-name"
+[[r2_buckets]]
+binding = "MEDIA_BUCKET"
+bucket_name = "xhs-images"

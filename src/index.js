@@ -1,5 +1,19 @@
+import {
+  CANONICAL_R2_ORIGIN,
+  collapseCanonicalAssets,
+  isTemporaryNotionHostedUrl,
+  parseCanonicalMediaUrl,
+} from "./media-ingestion.js";
+import {
+  assertR2Config,
+  ingestSourceToR2,
+  isR2Configured,
+  validateIngestUrlInput,
+} from "./r2-ingestion.js";
+
 const NOTION_VERSION = "2025-09-03";
 const SCHEMA_CACHE_TTL_MS = 5 * 60 * 1000;
+const MAX_NOTION_QUERY_PAGES = 10;
 
 const DEFAULT_MEDIA_ASSET_PROPS = {
   assetType: "Image",
@@ -69,14 +83,18 @@ export default {
     const url = new URL(request.url);
 
     try {
-      assertConfig(env);
-
-      if (url.pathname === "/health") {
-        return jsonResponse({ ok: true, service: "media-assets-worker" });
+      if (url.pathname === "/health" && request.method === "GET") {
+        return jsonResponse({
+          ok: true,
+          service: "media-assets-worker",
+          r2Configured: isR2Configured(env),
+        });
       }
 
+      await assertAuthorized(request, env);
+      assertConfig(env);
+
       if (url.pathname === "/test" && request.method === "GET") {
-        await assertAuthorized(request, env);
         const result = await createMediaAsset(env, {
           name: "Worker test asset",
           notes: "Created by Cloudflare Worker test endpoint.",
@@ -86,7 +104,6 @@ export default {
       }
 
       if (url.pathname === "/media-assets" && request.method === "POST") {
-        await assertAuthorized(request, env);
         const input = await safeJson(request);
         const result = await createMediaAsset(env, input);
         return jsonResponse({ ok: true, result });
@@ -94,25 +111,35 @@ export default {
 
       const postRoute = url.pathname.match(/^\/post\/([^/]+)$/);
       if (postRoute && request.method === "GET") {
-        await assertAuthorized(request, env);
         const postId = validatePostId(decodeURIComponent(postRoute[1]));
         const post = await getPost(env, postId);
         return jsonResponse({ ok: true, result: simplifyPostPage(post) });
       }
 
       if (url.pathname === "/from-post" && request.method === "POST") {
-        await assertAuthorized(request, env);
         const input = await safeJson(request);
         const postId = validateFromPostInput(input);
         const result = await createMediaAssetFromPost(env, postId);
         return jsonResponse({ ok: true, ...result });
       }
 
+      if (url.pathname === "/ingest-url" && request.method === "POST") {
+        const input = validateIngestUrlInput(await safeJson(request));
+        const postId =
+          input.postId === null ? null : validatePostId(input.postId);
+        const result = await ingestSourceToR2(env, {
+          sourceUrl: input.sourceUrl,
+          postId,
+          kind: input.kind,
+        });
+        return jsonResponse({ ok: true, result });
+      }
+
       return jsonResponse(
         {
           ok: false,
           error:
-            "Not found. Try GET /health, GET /test, GET /post/:id, POST /media-assets, or POST /from-post.",
+            "Not found. Try GET /health, GET /test, GET /post/:id, POST /media-assets, POST /from-post, or POST /ingest-url.",
         },
         404
       );
@@ -136,6 +163,7 @@ function assertConfig(env) {
   if (!env.MEDIA_ASSETS_DATA_SOURCE_ID) {
     missing.push("MEDIA_ASSETS_DATA_SOURCE_ID");
   }
+  if (!env.R2_PUBLIC_BASE_URL) missing.push("R2_PUBLIC_BASE_URL");
 
   if (missing.length) {
     throw httpError(
@@ -143,9 +171,13 @@ function assertConfig(env) {
       `Missing required environment variables: ${missing.join(", ")}`
     );
   }
+  assertR2Config(env);
 }
 
 async function assertAuthorized(request, env) {
+  if (!env?.WORKER_API_KEY) {
+    throw httpError(503, "Service is not configured.");
+  }
   const authorization = request.headers.get("Authorization") || "";
   const [scheme, token] = authorization.split(" ");
 
@@ -186,7 +218,7 @@ async function createMediaAssetFromPost(env, postId) {
   if (!simplifiedPost.assets.length) {
     throw httpError(
       409,
-      "Post does not qualify: no stable external http(s) URL was found in an image URL or thumbnail property.",
+      "Post does not qualify: no stable external HTTPS URL was found in an image URL or thumbnail property.",
       {
         checkedProperties: [
           ...SOURCE_FIELD_ALIASES.imageUrl,
@@ -196,6 +228,23 @@ async function createMediaAssetFromPost(env, postId) {
     );
   }
 
+  const ingested = [];
+  for (const sourceAsset of simplifiedPost.assets) {
+    const ingestion = await ingestSourceToR2(env, {
+      sourceUrl: sourceAsset.url,
+      postId: simplifiedPost.id,
+      kind: sourceAsset.sourceKind === "thumbnail" ? "image" : null,
+    });
+    ingested.push({ sourceAsset, ingestion });
+  }
+
+  const collapsed = collapseCanonicalAssets(ingested);
+  const recordsByCanonicalKey = new Map();
+  for (const record of ingested) {
+    const records = recordsByCanonicalKey.get(record.ingestion.key) || [];
+    records.push(record);
+    recordsByCanonicalKey.set(record.ingestion.key, records);
+  }
   const schema = await getMediaAssetsSchema(env);
   const destinationProperties = schema.properties || {};
   if (
@@ -210,52 +259,122 @@ async function createMediaAssetFromPost(env, postId) {
       "Media Assets schema must expose a URL property named Cloudflare URL for idempotent Post imports."
     );
   }
+  if (
+    !findSchemaProperty(
+      destinationProperties,
+      DESTINATION_FIELD_ALIASES.sourcePost,
+      "relation"
+    )
+  ) {
+    throw httpError(
+      500,
+      "Media Assets schema must expose a Source Post relation for Post-scoped catalog identity."
+    );
+  }
   const results = [];
   let created = 0;
+  let updated = 0;
   let existing = 0;
 
-  for (const asset of simplifiedPost.assets) {
-    let page = await findExistingMediaAsset(
+  for (const record of collapsed.unique) {
+    const asset = buildCanonicalPostAsset(
+      record.sourceAsset,
+      record.ingestion
+    );
+    const canonicalRows = await findExistingMediaAssets(
       env,
       schema,
       simplifiedPost,
       asset
     );
-    let wasCreated = false;
+    const canonicalIds = new Set(canonicalRows.map((page) => page.id));
+    const legacyRowsById = new Map();
+    for (const candidate of recordsByCanonicalKey.get(record.ingestion.key)) {
+      if (candidate.sourceAsset.url === asset.url) continue;
+      const matches = await findExistingMediaAssets(
+        env,
+        schema,
+        simplifiedPost,
+        candidate.sourceAsset
+      );
+      for (const page of matches) {
+        if (!canonicalIds.has(page.id)) legacyRowsById.set(page.id, page);
+      }
+    }
+    const legacyRows = [...legacyRowsById.values()].sort(comparePageIds);
+    const notionRows = [];
 
-    if (page) {
+    for (const legacyRow of legacyRows) {
+      const page = await updateLegacyMediaAsset(
+        env,
+        destinationProperties,
+        legacyRow,
+        asset
+      );
+      updated += 1;
+      notionRows.push(
+        summarizeReconciledRow(page, "updated")
+      );
+    }
+
+    for (const canonicalRow of [...canonicalRows].sort(comparePageIds)) {
       existing += 1;
-    } else {
+      notionRows.push(
+        summarizeReconciledRow(canonicalRow, "existing")
+      );
+    }
+
+    if (!notionRows.length) {
       const payload = buildFromPostMediaAssetPayload(
         env,
         simplifiedPost,
         destinationProperties,
         asset
       );
-      page = await notionFetch(env, "/v1/pages", {
+      const page = await notionFetch(env, "/v1/pages", {
         method: "POST",
         body: JSON.stringify(payload),
       });
       created += 1;
-      wasCreated = true;
+      notionRows.push(summarizeReconciledRow(page, "created"));
     }
 
+    const primary = notionRows[0];
+    const notionActions = [...new Set(notionRows.map((row) => row.action))];
     results.push({
+      sourceUrl: record.sourceAsset.url,
       url: asset.url,
-      created: wasCreated,
-      id: page.id,
-      rowUrl: page.url,
+      cloudflarePath: asset.path,
+      r2Action: record.ingestion.r2Action,
+      r2Reused: record.ingestion.r2Reused,
+      r2Uploaded: record.ingestion.r2Uploaded,
+      stagingResumed: record.ingestion.stagingResumed,
+      notionAction:
+        notionActions.length === 1 ? notionActions[0] : "reconciled",
+      notionActions,
+      notionRows,
+      reconciledRowIds: notionRows.map((row) => row.id),
+      created: notionRows.some((row) => row.action === "created"),
+      updated: notionRows.some((row) => row.action === "updated"),
+      existing: notionRows.some((row) => row.action === "existing"),
+      id: primary.id,
+      rowUrl: primary.rowUrl,
       sourceKind: asset.sourceKind,
       sourceIndex: asset.sourceIndex,
     });
   }
 
   return {
-    totalAssets: simplifiedPost.assets.length,
+    sourceAssets: simplifiedPost.assets.length,
+    totalAssets: collapsed.unique.length,
     created,
+    updated,
     existing,
-    skipped: simplifiedPost.qualification.skipped,
+    deduplicated: collapsed.duplicates.length,
+    skipped:
+      simplifiedPost.qualification.skipped + collapsed.duplicates.length,
     results,
+    duplicates: collapsed.duplicates,
   };
 }
 
@@ -275,25 +394,103 @@ async function getMediaAssetsSchema(env) {
   return schema;
 }
 
-async function findExistingMediaAsset(env, schema, post, asset) {
+async function findExistingMediaAssets(env, schema, post, asset) {
   const properties = schema.properties || {};
   const filter = buildExistingMediaAssetFilter(
     properties,
     post.id,
     asset.url
   );
-  if (!filter) return null;
+  if (!filter) return [];
+  return queryMediaAssetRows(env, filter);
+}
 
-  const query = await notionFetch(
-    env,
-    `/v1/data_sources/${env.MEDIA_ASSETS_DATA_SOURCE_ID}/query`,
-    {
-      method: "POST",
-      body: JSON.stringify({ filter, page_size: 1 }),
+async function queryMediaAssetRows(env, filter) {
+  const results = [];
+  let startCursor;
+
+  for (let page = 0; page < MAX_NOTION_QUERY_PAGES; page += 1) {
+    const query = await notionFetch(
+      env,
+      `/v1/data_sources/${env.MEDIA_ASSETS_DATA_SOURCE_ID}/query`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          filter,
+          page_size: 100,
+          ...(startCursor ? { start_cursor: startCursor } : {}),
+        }),
+      }
+    );
+    results.push(...(query.results || []));
+    if (!query.has_more) return uniquePages(results);
+    if (!query.next_cursor) {
+      throw httpError(502, "Notion pagination did not return a cursor.");
     }
-  );
+    startCursor = query.next_cursor;
+  }
 
-  return query.results?.[0] || null;
+  throw httpError(
+    409,
+    "Media Assets query exceeded the safe reconciliation page limit."
+  );
+}
+
+async function updateLegacyMediaAsset(
+  env,
+  destinationSchema,
+  page,
+  asset
+) {
+  const properties = buildCanonicalMediaAssetUpdateProperties(
+    destinationSchema,
+    asset
+  );
+  return notionFetch(env, `/v1/pages/${page.id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ properties }),
+  });
+}
+
+function summarizeReconciledRow(page, action) {
+  return {
+    id: page.id,
+    rowUrl: page.url,
+    action,
+  };
+}
+
+function uniquePages(pages) {
+  const unique = new Map();
+  for (const page of pages) {
+    if (page?.id) unique.set(page.id, page);
+  }
+  return [...unique.values()];
+}
+
+function comparePageIds(left, right) {
+  return String(left.id).localeCompare(String(right.id));
+}
+
+function buildCanonicalPostAsset(sourceAsset, ingestion) {
+  return {
+    ...sourceAsset,
+    sourceUrl: sourceAsset.url,
+    url: ingestion.url,
+    path: ingestion.cloudflarePath,
+    filename: ingestion.filename,
+    format: ingestion.format,
+    assetType:
+      sourceAsset.sourceKind === "thumbnail"
+        ? "Cover"
+        : ingestion.mediaKind === "video"
+          ? "Video"
+          : "Image",
+    r2Stored: true,
+    sha256: ingestion.sha256,
+    size: ingestion.size,
+    contentType: ingestion.contentType,
+  };
 }
 
 export function buildExistingMediaAssetFilter(
@@ -318,7 +515,7 @@ export function buildExistingMediaAssetFilter(
     "relation"
   );
 
-  if (!sourcePost) return urlFilter;
+  if (!sourcePost || !postId) return null;
 
   return {
     and: [
@@ -329,6 +526,64 @@ export function buildExistingMediaAssetFilter(
       urlFilter,
     ],
   };
+}
+
+export function buildCanonicalMediaAssetUpdateProperties(
+  destinationSchema,
+  asset
+) {
+  const properties = {};
+  setCompatibleProperty(
+    properties,
+    destinationSchema,
+    DESTINATION_FIELD_ALIASES.cloudflareUrl,
+    asset.url
+  );
+  setCompatibleProperty(
+    properties,
+    destinationSchema,
+    DESTINATION_FIELD_ALIASES.cloudflarePath,
+    asset.path
+  );
+  setCompatibleProperty(
+    properties,
+    destinationSchema,
+    DESTINATION_FIELD_ALIASES.filename,
+    asset.filename
+  );
+  setCompatibleProperty(
+    properties,
+    destinationSchema,
+    DESTINATION_FIELD_ALIASES.format,
+    asset.format
+  );
+  setCompatibleProperty(
+    properties,
+    destinationSchema,
+    DESTINATION_FIELD_ALIASES.assetType,
+    asset.assetType
+  );
+  if (asset.r2Stored === true) {
+    setCompatibleProperty(
+      properties,
+      destinationSchema,
+      DESTINATION_FIELD_ALIASES.storageStatus,
+      "Uploaded to Cloudflare"
+    );
+    setCompatibleProperty(
+      properties,
+      destinationSchema,
+      DESTINATION_FIELD_ALIASES.assetStatus,
+      "Uploaded to Cloudflare"
+    );
+  }
+  setCompatibleProperty(
+    properties,
+    destinationSchema,
+    DESTINATION_FIELD_ALIASES.productLane,
+    "Rednote post"
+  );
+  return properties;
 }
 
 async function createMediaAsset(env, input = {}) {
@@ -350,6 +605,9 @@ function summarizeMediaAsset(page) {
 }
 
 function buildMediaAssetPayload(env, input) {
+  if (!input || Array.isArray(input) || typeof input !== "object") {
+    throw httpError(400, "Request body must be a JSON object.");
+  }
   const name = cleanString(input.name) || "Untitled media asset";
   const notes = cleanString(input.notes);
   const series = cleanString(input.series || input.seriesCampaign);
@@ -367,6 +625,16 @@ function buildMediaAssetPayload(env, input) {
     cleanString(input.assetStatus) || DEFAULT_MEDIA_ASSET_PROPS.assetStatus;
   const storageStatus =
     cleanString(input.storageStatus) || DEFAULT_MEDIA_ASSET_PROPS.storageStatus;
+  if (
+    [assetStatus, storageStatus].some(
+      (value) => value.toLowerCase() === "uploaded to cloudflare"
+    )
+  ) {
+    throw httpError(
+      400,
+      "POST /media-assets is metadata-only and cannot mark assets as uploaded to Cloudflare."
+    );
+  }
 
   const properties = {
     Name: title(name),
@@ -416,7 +684,8 @@ export function buildFromPostMediaAssetPayload(
     cleanString(asset.name) ||
     filename ||
     `Post ${post.id}`;
-  const cloudflareStored = isCloudflareStorageUrl(cloudflareUrl, env);
+  const cloudflareStored =
+    asset.r2Stored === true && isCloudflareStorageUrl(cloudflareUrl, env);
   const assetStatus = cloudflareStored
     ? "Uploaded to Cloudflare"
     : DEFAULT_MEDIA_ASSET_PROPS.assetStatus;
@@ -1038,29 +1307,13 @@ function countCharacter(value, character) {
 function normalizeStableAssetUrl(value) {
   try {
     const url = new URL(value);
-    if (!["http:", "https:"].includes(url.protocol)) return null;
+    if (url.protocol !== "https:") return null;
     if (isTemporaryNotionHostedUrl(url)) return null;
     url.hash = "";
     return url.href;
   } catch {
     return null;
   }
-}
-
-function isTemporaryNotionHostedUrl(url) {
-  const hostname = url.hostname.toLowerCase();
-  const pathname = url.pathname.toLowerCase();
-
-  return (
-    hostname === "file.notion.so" ||
-    hostname === "secure.notion-static.com" ||
-    hostname.endsWith(".notion-static.com") ||
-    (hostname.startsWith("prod-files-secure.s3") &&
-      hostname.endsWith(".amazonaws.com")) ||
-    (hostname.startsWith("s3.") &&
-      hostname.endsWith(".amazonaws.com") &&
-      pathname.includes("/secure.notion-static.com/"))
-  );
 }
 
 function cloudflarePathFromUrl(value) {
@@ -1126,31 +1379,12 @@ function legacyQualifiedAsset(post) {
 }
 
 function isCloudflareStorageUrl(value, env = {}) {
-  let url;
-  try {
-    url = new URL(value);
-  } catch {
-    return false;
-  }
-
-  const hostname = url.hostname.toLowerCase();
-  const knownCloudflareHost =
-    hostname.endsWith(".r2.dev") ||
-    hostname.endsWith(".r2.cloudflarestorage.com") ||
-    hostname === "imagedelivery.net" ||
-    hostname.endsWith(".imagedelivery.net") ||
-    hostname === "videodelivery.net" ||
-    hostname.endsWith(".videodelivery.net");
-  if (knownCloudflareHost) return true;
-
-  try {
-    return (
-      env.PUBLIC_R2_BASE_URL &&
-      hostname === new URL(env.PUBLIC_R2_BASE_URL).hostname.toLowerCase()
-    );
-  } catch {
-    return false;
-  }
+  return Boolean(
+    parseCanonicalMediaUrl(
+      value,
+      env.R2_PUBLIC_BASE_URL || CANONICAL_R2_ORIGIN
+    )
+  );
 }
 
 function uniqueTextValues(values) {
