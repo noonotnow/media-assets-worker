@@ -9,7 +9,7 @@ const DEFAULT_MEDIA_ASSET_PROPS = {
 
 export const SOURCE_FIELD_ALIASES = Object.freeze({
   headline: ["Headline", "Title", "Name"],
-  imageUrl: ["Images URL", "Image URL", "Images"],
+  imageUrl: ["Image URLs", "Images URL", "Image URL", "Images"],
   thumbnail: ["Thumbnail", "Thumbnail URL"],
   platform: ["Platform"],
   series: ["Series"],
@@ -55,6 +55,7 @@ const DESTINATION_FIELD_ALIASES = Object.freeze({
   ],
   requirements: ["Requirements"],
   needsMedia: ["Needs media", "Needs Media"],
+  productLane: ["Product Lane"],
 });
 
 const mediaAssetsSchemaCache = new Map();
@@ -182,10 +183,10 @@ async function createMediaAssetFromPost(env, postId) {
   const post = await getPost(env, postId);
   const simplifiedPost = simplifyPostPage(post);
 
-  if (!simplifiedPost.qualification.qualified) {
+  if (!simplifiedPost.assets.length) {
     throw httpError(
       409,
-      "Post does not qualify: no valid http(s) URL was found in an image URL or thumbnail property.",
+      "Post does not qualify: no stable external http(s) URL was found in an image URL or thumbnail property.",
       {
         checkedProperties: [
           ...SOURCE_FIELD_ALIASES.imageUrl,
@@ -196,28 +197,65 @@ async function createMediaAssetFromPost(env, postId) {
   }
 
   const schema = await getMediaAssetsSchema(env);
-  const existing = await findExistingMediaAsset(env, schema, simplifiedPost);
+  const destinationProperties = schema.properties || {};
+  if (
+    !findSchemaProperty(
+      destinationProperties,
+      DESTINATION_FIELD_ALIASES.cloudflareUrl,
+      "url"
+    )
+  ) {
+    throw httpError(
+      500,
+      "Media Assets schema must expose a URL property named Cloudflare URL for idempotent Post imports."
+    );
+  }
+  const results = [];
+  let created = 0;
+  let existing = 0;
 
-  if (existing) {
-    return {
-      created: false,
-      result: summarizeMediaAsset(existing),
-    };
+  for (const asset of simplifiedPost.assets) {
+    let page = await findExistingMediaAsset(
+      env,
+      schema,
+      simplifiedPost,
+      asset
+    );
+    let wasCreated = false;
+
+    if (page) {
+      existing += 1;
+    } else {
+      const payload = buildFromPostMediaAssetPayload(
+        env,
+        simplifiedPost,
+        destinationProperties,
+        asset
+      );
+      page = await notionFetch(env, "/v1/pages", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      created += 1;
+      wasCreated = true;
+    }
+
+    results.push({
+      url: asset.url,
+      created: wasCreated,
+      id: page.id,
+      rowUrl: page.url,
+      sourceKind: asset.sourceKind,
+      sourceIndex: asset.sourceIndex,
+    });
   }
 
-  const payload = buildFromPostMediaAssetPayload(
-    env,
-    simplifiedPost,
-    schema.properties || {}
-  );
-  const created = await notionFetch(env, "/v1/pages", {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
-
   return {
-    created: true,
-    result: summarizeMediaAsset(created),
+    totalAssets: simplifiedPost.assets.length,
+    created,
+    existing,
+    skipped: simplifiedPost.qualification.skipped,
+    results,
   };
 }
 
@@ -237,34 +275,14 @@ async function getMediaAssetsSchema(env) {
   return schema;
 }
 
-async function findExistingMediaAsset(env, schema, post) {
+async function findExistingMediaAsset(env, schema, post, asset) {
   const properties = schema.properties || {};
-  const sourcePost = findSchemaProperty(
+  const filter = buildExistingMediaAssetFilter(
     properties,
-    DESTINATION_FIELD_ALIASES.sourcePost,
-    "relation"
+    post.id,
+    asset.url
   );
-  let filter;
-
-  if (sourcePost) {
-    filter = {
-      property: sourcePost.name,
-      relation: { contains: post.id },
-    };
-  } else {
-    const cloudflareUrl = findSchemaProperty(
-      properties,
-      DESTINATION_FIELD_ALIASES.cloudflareUrl,
-      "url"
-    );
-
-    if (!cloudflareUrl) return null;
-
-    filter = {
-      property: cloudflareUrl.name,
-      url: { equals: post.qualification.cloudflareUrl },
-    };
-  }
+  if (!filter) return null;
 
   const query = await notionFetch(
     env,
@@ -276,6 +294,41 @@ async function findExistingMediaAsset(env, schema, post) {
   );
 
   return query.results?.[0] || null;
+}
+
+export function buildExistingMediaAssetFilter(
+  destinationSchema,
+  postId,
+  cloudflareUrl
+) {
+  const urlProperty = findSchemaProperty(
+    destinationSchema,
+    DESTINATION_FIELD_ALIASES.cloudflareUrl,
+    "url"
+  );
+  if (!urlProperty || !cloudflareUrl) return null;
+
+  const urlFilter = {
+    property: urlProperty.name,
+    url: { equals: cloudflareUrl },
+  };
+  const sourcePost = findSchemaProperty(
+    destinationSchema,
+    DESTINATION_FIELD_ALIASES.sourcePost,
+    "relation"
+  );
+
+  if (!sourcePost) return urlFilter;
+
+  return {
+    and: [
+      {
+        property: sourcePost.name,
+        relation: { contains: postId },
+      },
+      urlFilter,
+    ],
+  };
 }
 
 async function createMediaAsset(env, input = {}) {
@@ -350,18 +403,26 @@ function buildMediaAssetPayload(env, input) {
 export function buildFromPostMediaAssetPayload(
   env,
   post,
-  destinationSchema
+  destinationSchema,
+  asset = post.assets?.[0] || legacyQualifiedAsset(post)
 ) {
   const properties = {};
   const fields = post.fields;
-  const cloudflareUrl = post.qualification.cloudflareUrl;
-  const cloudflarePath = post.qualification.cloudflarePath;
-  const filename = filenameFromUrl(cloudflareUrl);
-  const format = formatFromFilename(filename);
+  const cloudflareUrl = asset.url;
+  const cloudflarePath = asset.path;
+  const filename = asset.filename;
+  const format = asset.format;
   const name =
-    cleanString(fields.headline?.value) ||
+    cleanString(asset.name) ||
     filename ||
     `Post ${post.id}`;
+  const cloudflareStored = isCloudflareStorageUrl(cloudflareUrl, env);
+  const assetStatus = cloudflareStored
+    ? "Uploaded to Cloudflare"
+    : DEFAULT_MEDIA_ASSET_PROPS.assetStatus;
+  const storageStatus = cloudflareStored
+    ? "Uploaded to Cloudflare"
+    : DEFAULT_MEDIA_ASSET_PROPS.storageStatus;
   const titleProperty =
     findSchemaProperty(
       destinationSchema,
@@ -382,19 +443,19 @@ export function buildFromPostMediaAssetPayload(
     properties,
     destinationSchema,
     DESTINATION_FIELD_ALIASES.assetType,
-    DEFAULT_MEDIA_ASSET_PROPS.assetType
+    asset.assetType || DEFAULT_MEDIA_ASSET_PROPS.assetType
   );
   setCompatibleProperty(
     properties,
     destinationSchema,
     DESTINATION_FIELD_ALIASES.assetStatus,
-    DEFAULT_MEDIA_ASSET_PROPS.assetStatus
+    assetStatus
   );
   setCompatibleProperty(
     properties,
     destinationSchema,
     DESTINATION_FIELD_ALIASES.storageStatus,
-    DEFAULT_MEDIA_ASSET_PROPS.storageStatus
+    storageStatus
   );
   setCompatibleProperty(
     properties,
@@ -430,7 +491,13 @@ export function buildFromPostMediaAssetPayload(
     properties,
     destinationSchema,
     DESTINATION_FIELD_ALIASES.canonicalLabel,
-    cleanString(fields.headline?.value)
+    asset.canonicalLabel
+  );
+  setCompatibleProperty(
+    properties,
+    destinationSchema,
+    DESTINATION_FIELD_ALIASES.productLane,
+    "Rednote post"
   );
 
   const seriesCampaign = uniqueTextValues([
@@ -493,16 +560,26 @@ export function simplifyPostPage(page) {
   const fields = {};
 
   for (const [fieldName, aliases] of Object.entries(SOURCE_FIELD_ALIASES)) {
-    let match = findPageProperty(properties, aliases);
-    if (!match && fieldName === "headline") {
-      match = findFirstPageProperty(properties, "title");
+    const aliasMatches = findPageProperties(properties, aliases);
+    let matches = ["imageUrl", "thumbnail"].includes(fieldName)
+      ? aliasMatches
+      : aliasMatches.slice(0, 1);
+    if (!matches.length && fieldName === "headline") {
+      const fallback = findFirstPageProperty(properties, "title");
+      matches = fallback ? [fallback] : [];
     }
 
-    fields[fieldName] = match
+    fields[fieldName] = matches.length
       ? {
-          propertyName: match.name,
-          type: match.property.type,
-          value: propertyToSimpleValue(match.property),
+          propertyName: matches[0].name,
+          propertyNames: matches.map((match) => match.name),
+          type: matches[0].property.type,
+          value: combineSimplePropertyValues(matches),
+          sources: matches.map((match) => ({
+            propertyName: match.name,
+            type: match.property.type,
+            value: propertyToSimpleValue(match.property),
+          })),
         }
       : null;
   }
@@ -515,27 +592,139 @@ export function simplifyPostPage(page) {
     createdTime: page.created_time,
     lastEditedTime: page.last_edited_time,
     fields,
+    assets: qualification.assets,
     qualification,
   };
 }
 
 export function qualifyPostFields(fields) {
-  const imageUrl = firstHttpUrl(fields.imageUrl?.value);
-  const thumbnailUrl = firstHttpUrl(fields.thumbnail?.value);
-  const cloudflareUrl = imageUrl || thumbnailUrl || null;
-  const source = imageUrl
-    ? fields.imageUrl?.propertyName
-    : thumbnailUrl
-      ? fields.thumbnail?.propertyName
-      : null;
+  const { assets, skipped } = buildPostAssets(fields);
+  const preferred = assets[0] || null;
 
   return {
-    qualified: Boolean(cloudflareUrl),
-    cloudflareUrl,
-    cloudflarePath: cloudflareUrl
-      ? cloudflarePathFromUrl(cloudflareUrl)
-      : null,
-    sourceProperty: source,
+    qualified: assets.length > 0,
+    cloudflareUrl: preferred?.url || null,
+    cloudflarePath: preferred?.path || null,
+    sourceProperty: preferred?.sourceProperty || null,
+    totalAssets: assets.length,
+    skipped,
+    assets,
+  };
+}
+
+export function buildPostAssets(fields) {
+  const headline = cleanString(fields.headline?.value);
+  const imageExtraction = extractStableFieldUrls(fields.imageUrl);
+  const thumbnailExtraction = extractStableFieldUrls(fields.thumbnail);
+  const seen = new Set();
+  const assets = [];
+  let skipped = imageExtraction.skipped + thumbnailExtraction.skipped;
+
+  for (const source of imageExtraction.urls) {
+    const { url } = source;
+    if (seen.has(url)) {
+      skipped += 1;
+      continue;
+    }
+
+    seen.add(url);
+    const sourceIndex = assets.filter(
+      (asset) => asset.sourceKind === "image"
+    ).length + 1;
+    assets.push(
+      describePostAsset({
+        url,
+        headline,
+        sourceKind: "image",
+        sourceIndex,
+        sourceProperty: source.propertyName,
+      })
+    );
+  }
+
+  for (const source of thumbnailExtraction.urls) {
+    const { url } = source;
+    if (seen.has(url)) {
+      skipped += 1;
+      continue;
+    }
+
+    seen.add(url);
+    const sourceIndex =
+      assets.filter((asset) => asset.sourceKind === "thumbnail").length + 1;
+    assets.push(
+      describePostAsset({
+        url,
+        headline,
+        sourceKind: "thumbnail",
+        sourceIndex,
+        sourceProperty: source.propertyName,
+      })
+    );
+  }
+
+  return { assets, skipped };
+}
+
+function extractStableFieldUrls(field) {
+  const sources =
+    field?.sources ||
+    (field
+      ? [
+          {
+            propertyName: field.propertyName || null,
+            value: field.value,
+          },
+        ]
+      : []);
+  const urls = [];
+  const seen = new Set();
+  let skipped = 0;
+
+  for (const source of sources) {
+    const extraction = extractStableAssetUrlsWithStats(source.value);
+    skipped += extraction.skipped;
+    for (const url of extraction.urls) {
+      if (seen.has(url)) {
+        skipped += 1;
+        continue;
+      }
+      seen.add(url);
+      urls.push({ url, propertyName: source.propertyName || null });
+    }
+  }
+
+  return { urls, skipped };
+}
+
+function describePostAsset({
+  url,
+  headline,
+  sourceKind,
+  sourceIndex,
+  sourceProperty,
+}) {
+  const path = cloudflarePathFromUrl(url);
+  const filename = filenameFromUrl(url);
+  const thumbnail = sourceKind === "thumbnail";
+  const label = headline || filename || "Untitled post";
+  const suffix = thumbnail
+    ? sourceIndex === 1
+      ? "thumbnail"
+      : `thumbnail ${String(sourceIndex).padStart(2, "0")}`
+    : `asset ${String(sourceIndex).padStart(2, "0")}`;
+
+  return {
+    url,
+    path,
+    filename,
+    format: formatFromFilename(filename),
+    assetType: thumbnail ? "Cover" : assetTypeFromFilename(filename),
+    canonicalLabel: thumbnail ? "Thumbnail" : headline || null,
+    name: `${label} — ${suffix}`,
+    sourceKind,
+    sourceIndex,
+    sourceProperty,
   };
 }
 
@@ -651,14 +840,20 @@ function findFirstSchemaProperty(schema, type) {
   return match ? { name: match[0], property: match[1] } : null;
 }
 
-function findPageProperty(properties, aliases) {
+function findPageProperties(properties, aliases) {
+  const matches = [];
+  const matchedNames = new Set();
+
   for (const alias of aliases) {
     const match = Object.entries(properties).find(
       ([name]) => name.toLowerCase() === alias.toLowerCase()
     );
-    if (match) return { name: match[0], property: match[1] };
+    if (match && !matchedNames.has(match[0].toLowerCase())) {
+      matchedNames.add(match[0].toLowerCase());
+      matches.push({ name: match[0], property: match[1] });
+    }
   }
-  return null;
+  return matches;
 }
 
 function findFirstPageProperty(properties, type) {
@@ -666,6 +861,17 @@ function findFirstPageProperty(properties, type) {
     ([, property]) => property.type === type
   );
   return match ? { name: match[0], property: match[1] } : null;
+}
+
+function combineSimplePropertyValues(matches) {
+  const values = matches.map((match) =>
+    propertyToSimpleValue(match.property)
+  );
+  if (values.length === 1) return values[0];
+
+  return values
+    .flatMap((value) => (Array.isArray(value) ? value : [value]))
+    .filter((value) => value !== null && value !== undefined && value !== "");
 }
 
 function propertyToSimpleValue(property) {
@@ -739,27 +945,77 @@ function validatePostId(value) {
 }
 
 function firstHttpUrl(value) {
-  const values = Array.isArray(value) ? value : [value];
+  return extractStableAssetUrls(value)[0] || null;
+}
 
-  for (const candidate of values) {
-    if (Array.isArray(candidate)) {
-      const nested = firstHttpUrl(candidate);
-      if (nested) return nested;
+export function extractStableAssetUrls(value) {
+  return extractStableAssetUrlsWithStats(value).urls;
+}
+
+function extractStableAssetUrlsWithStats(value) {
+  const candidates = [];
+  collectUrlCandidates(value, candidates);
+  const urls = [];
+  const seen = new Set();
+  let skipped = 0;
+
+  for (const candidate of candidates) {
+    const normalized = normalizeStableAssetUrl(candidate);
+    if (!normalized) {
+      skipped += 1;
       continue;
     }
-
-    const text = cleanString(candidate);
-    if (!text) continue;
-
-    try {
-      const url = new URL(text);
-      if (url.protocol === "http:" || url.protocol === "https:") return text;
-    } catch {
-      // Ignore malformed source values and continue to the next candidate.
+    if (seen.has(normalized)) {
+      skipped += 1;
+      continue;
     }
+    seen.add(normalized);
+    urls.push(normalized);
   }
 
-  return null;
+  return { urls, skipped };
+}
+
+function collectUrlCandidates(value, output) {
+  if (Array.isArray(value)) {
+    for (const item of value) collectUrlCandidates(item, output);
+    return;
+  }
+
+  const text = cleanString(value);
+  if (!text) return;
+
+  for (const match of text.matchAll(/https?:\/\/[^\s,]+/gi)) {
+    output.push(match[0]);
+  }
+}
+
+function normalizeStableAssetUrl(value) {
+  try {
+    const url = new URL(value);
+    if (!["http:", "https:"].includes(url.protocol)) return null;
+    if (isTemporaryNotionHostedUrl(url)) return null;
+    url.hash = "";
+    return url.href;
+  } catch {
+    return null;
+  }
+}
+
+function isTemporaryNotionHostedUrl(url) {
+  const hostname = url.hostname.toLowerCase();
+  const pathname = url.pathname.toLowerCase();
+
+  return (
+    hostname === "file.notion.so" ||
+    hostname === "secure.notion-static.com" ||
+    hostname.endsWith(".notion-static.com") ||
+    (hostname.startsWith("prod-files-secure.s3") &&
+      hostname.endsWith(".amazonaws.com")) ||
+    (hostname.startsWith("s3.") &&
+      hostname.endsWith(".amazonaws.com") &&
+      pathname.includes("/secure.notion-static.com/"))
+  );
 }
 
 function cloudflarePathFromUrl(value) {
@@ -782,9 +1038,74 @@ function filenameFromUrl(value) {
 }
 
 function formatFromFilename(filename) {
-  const extension = cleanString(filename).split(".").at(-1);
-  if (!extension || extension === filename) return "";
-  return extension.toUpperCase();
+  const extension = filenameExtension(filename);
+  return (
+    {
+      jpg: "JPG",
+      jpeg: "JPG",
+      png: "PNG",
+      mp4: "MP4",
+    }[extension] || ""
+  );
+}
+
+function assetTypeFromFilename(filename) {
+  const extension = filenameExtension(filename);
+  if (["mp4", "mov", "webm"].includes(extension)) return "Video";
+  return "Image";
+}
+
+function filenameExtension(filename) {
+  const cleanFilename = cleanString(filename);
+  const extension = cleanFilename.split(".").at(-1);
+  if (!extension || extension === cleanFilename) return "";
+  return extension.toLowerCase();
+}
+
+function legacyQualifiedAsset(post) {
+  const url = post.qualification?.cloudflareUrl;
+  if (!url) return {};
+  const filename = filenameFromUrl(url);
+  return {
+    url,
+    path: post.qualification.cloudflarePath || cloudflarePathFromUrl(url),
+    filename,
+    format: formatFromFilename(filename),
+    assetType: assetTypeFromFilename(filename),
+    canonicalLabel: cleanString(post.fields?.headline?.value) || null,
+    name:
+      cleanString(post.fields?.headline?.value) ||
+      filename ||
+      `Post ${post.id}`,
+  };
+}
+
+function isCloudflareStorageUrl(value, env = {}) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    return false;
+  }
+
+  const hostname = url.hostname.toLowerCase();
+  const knownCloudflareHost =
+    hostname.endsWith(".r2.dev") ||
+    hostname.endsWith(".r2.cloudflarestorage.com") ||
+    hostname === "imagedelivery.net" ||
+    hostname.endsWith(".imagedelivery.net") ||
+    hostname === "videodelivery.net" ||
+    hostname.endsWith(".videodelivery.net");
+  if (knownCloudflareHost) return true;
+
+  try {
+    return (
+      env.PUBLIC_R2_BASE_URL &&
+      hostname === new URL(env.PUBLIC_R2_BASE_URL).hostname.toLowerCase()
+    );
+  } catch {
+    return false;
+  }
 }
 
 function uniqueTextValues(values) {
