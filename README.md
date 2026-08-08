@@ -18,13 +18,17 @@ manual Post ingestion and focused URL ingestion only.
 3. For an exact canonical URL, validate the canonical key and `HEAD` it in R2.
    Missing objects are rejected; canonical-looking URLs are never trusted on
    shape alone.
-4. For any other source, fetch public HTTPS only, follow at most five manually
-   validated redirects, and stream into `imports/staging/<upload-id>`.
+4. For any other source, first look for completed retry staging under a
+   source-fingerprint prefix. If none exists, fetch public HTTPS only, follow at
+   most five manually validated redirects, and stream into
+   `imports/staging/src-<source-sha256>-<upload-id>`.
 5. Inspect leading bytes, validate MIME compatibility, enforce byte limits,
    and incrementally calculate SHA-256 while uploading 16 MiB multipart parts.
 6. Derive the content-addressed key. Reuse a compatible existing canonical
-   object or stream-copy the completed staging object to that key.
-7. Set immutable cache metadata and R2 custom metadata, then delete staging.
+   object or stream-copy staging through a second, abortable multipart upload.
+   Canonical part uploads have bounded retries.
+7. Set immutable cache metadata and R2 custom metadata, verify the canonical
+   object with `HEAD`, and only then delete completed staging.
 8. After all source assets ingest successfully, query/update/create Notion
    rows using canonical URL/path values.
 
@@ -141,7 +145,8 @@ stable public HTTPS source before it can be ingested.
 The 1 GiB application limit is below R2 multipart limits (5 MiB minimum part
 except the final part, 10,000 parts, and multi-terabyte objects). The Worker
 uses 16 MiB parts and stays below the 128 MB isolate memory limit by never
-buffering a full video.
+buffering a full video. It keeps one part plus bounded stream/hash state in
+memory.
 
 Incremental SHA-256 is CPU work. Cloudflare Workers Free allows only 10 ms CPU
 per request and is not suitable for this ingestion flow. Workers Paid defaults
@@ -153,13 +158,38 @@ cpu_ms = 300_000
 ```
 
 Do not add that override blindly: confirm the account is on Workers Paid and
-use Worker CPU metrics with representative large videos first. HTTP Workers
-have no fixed wall-clock limit while the client remains connected, but a
-disconnect can cancel the request. A 1 GiB transfer therefore remains
-dependent on source throughput, client connection lifetime, CPU allowance, and
-Cloudflare runtime updates. R2 also rate-limits concurrent writes to the same
-key; a failed canonical write is reconciled with a compatible `HEAD` so an
-identical concurrent winner can be reused.
+use Worker CPU metrics with representative large videos first. Workers Free
+also allows only 50 subrequests per invocation, while Workers Paid allows
+10,000. A fresh 1 GiB ingest uses 64 staging parts and 64 destination parts,
+plus source fetch, create/complete, `HEAD`, `GET`, list, and delete operations,
+so it cannot fit the Free subrequest budget. The six simultaneous outgoing
+connection limit is respected because part operations are sequential.
+
+HTTP Workers have no fixed wall-clock limit while the client remains connected,
+but a disconnect can cancel the request; runtime updates provide only a
+30-second grace period to in-flight work. The Worker additionally caps each
+source or R2 staging stream at 30 minutes. A 1 GiB transfer therefore remains
+dependent on source throughput, client connection lifetime, CPU allowance,
+subrequest allowance, and runtime updates.
+
+The 30-minute source-staging and canonical-promotion deadlines cover stream
+reads, multipart creation, part uploads, completion, and canonical
+verification; they do not reset after each part.
+
+The native Workers R2 API has no server-side object copy operation. Canonical
+promotion must stream the completed staging object back through the Worker into
+a destination multipart upload. On promotion failure, destination multipart is
+aborted and completed staging is preserved. A later request for the identical
+normalized source URL discovers that staging, verifies and re-hashes it, and
+retries promotion without downloading the public source again. Retry still
+requires a full staging read, and promotion requires another full staging read;
+this is the principal operational limitation for 1 GiB objects. Incomplete R2
+multipart uploads are automatically aborted by R2 after seven days if an abort
+request itself cannot be confirmed.
+
+R2 rate-limits concurrent writes to the same key. A failed canonical write is
+reconciled with a compatible `HEAD` so an identical concurrent winner can be
+reused.
 
 ## Notion behavior
 
@@ -177,16 +207,25 @@ the response `duplicates` array with reason `duplicate-content`.
 After R2 success:
 
 - Query exact canonical Cloudflare URL first.
-- If it exists, return it and append the current Source Post relation when that
-  can be done without replacing existing relations.
-- Otherwise query Source Post + original source URL. A legacy row is updated
-  only in Cloudflare URL, Cloudflare Path, Filename, supported Format, Asset
-  Type, Storage Status, Asset Status, and Product Lane.
+- Return every exact canonical Cloudflare URL row, not only the first.
+- Query Source Post + every original source URL that collapsed to the canonical
+  object. Every matching legacy row is updated in Cloudflare URL, Cloudflare
+  Path, Filename, supported Format, Asset Type, Storage Status, Asset Status,
+  and Product Lane.
 - Otherwise create a new schema-compatible row.
 
 Human notes and unrelated metadata are not replaced during legacy migration.
 `Uploaded to Cloudflare` is written only after successful R2 validation and
 only when the destination option already exists.
+
+Source Post relation updates are serialized per Media Asset page within one
+Worker isolate. Each update re-fetches the page, writes the union, and
+re-fetches to verify it, retrying a bounded number of times if a concurrent
+write is observed. Notion exposes no ETag/conditional relation update, so
+cross-isolate convergence remains best effort; an observed failure to preserve
+the union returns an error instead of silently dropping relations. Because a
+page response exposes at most 25 inline relation entries, adding a 26th Source
+Post is rejected before mutation rather than writing an unverifiable array.
 
 Notion dedupe remains a best-effort query-then-create operation. Concurrent
 requests can still create duplicate Notion rows; Durable Object serialization
@@ -195,7 +234,7 @@ concurrent writes for an identical hash/key contain identical bytes.
 
 ## Endpoints
 
-Every endpoint, including health, requires:
+All endpoints except `GET /health` require:
 
 ```txt
 Authorization: Bearer <WORKER_API_KEY>
@@ -203,7 +242,7 @@ Authorization: Bearer <WORKER_API_KEY>
 
 | Endpoint | Behavior |
 | --- | --- |
-| `GET /health` | Authenticated service health; reports only that R2 is configured. |
+| `GET /health` | Public minimal service health; reports only an R2 configured boolean. |
 | `GET /test` | Creates the existing Notion test row. It does not ingest media. |
 | `GET /post/:id` | Shows simplified Post fields and qualified source assets. |
 | `POST /media-assets` | Metadata-only Notion creation. It does not download or ingest a URL and cannot mark a row Uploaded to Cloudflare. |
@@ -251,9 +290,12 @@ curl -X POST "$WORKER_URL/from-post" \
 ```
 
 Each unique result includes `sourceUrl`, canonical `url`, `cloudflarePath`,
-`r2Action`, and `notionAction` (`created`, `updated`, or `existing`). Aggregate
-counts include source assets, canonical assets, created/updated/existing rows,
-deduplicated content, and skipped sources.
+`r2Action`, `stagingResumed`, and `notionRows`. Every Notion row reports its
+`id`, action (`created`, `updated`, or `existing`), and whether its Source Post
+relation changed. `reconciledRowIds` exposes all rows that converged to the
+canonical object; top-level `notionAction` is `reconciled` when actions differ.
+Aggregate counts include source assets, canonical assets,
+created/updated/existing rows, deduplicated content, and skipped sources.
 
 ### Metadata-only creation
 
@@ -270,10 +312,19 @@ curl -X POST "$WORKER_URL/media-assets" \
 
 ## Failure semantics
 
-- Validation, redirect, MIME, signature, timeout, and byte-limit failures abort
-  multipart upload and delete the staging key.
-- Canonical promotion is verified with `HEAD`; staging is then deleted on both
-  upload and reuse paths.
+- Validation, redirect, MIME, signature, timeout, byte-limit, and source-stream
+  failures abort incomplete staging multipart upload and delete its key.
+- Once staging multipart completes, canonical promotion failure returns
+  `R2_CANONICAL_PROMOTION_RETRYABLE` with a safe staging key containing only a
+  source hash and upload ID. Completed staging is deliberately preserved.
+- A later request for the same normalized source URL resumes from completed
+  staging before making any source fetch.
+- Canonical promotion uses an independently abortable multipart upload and is
+  verified with `HEAD`; staging is deleted only after compatible canonical
+  hash, size, and type verification.
+- Cleanup deletes only the exact staging object that was verified. Concurrent
+  retry staging for the same source fingerprint is left for its own request to
+  reconcile.
 - If staging cleanup itself fails, the request returns an explicit error rather
   than reporting success.
 - `/from-post` ingests all sources before making Notion changes. If a later
@@ -299,7 +350,7 @@ Manual production sequence:
 2. Confirm `NOTION_TOKEN` and `WORKER_API_KEY` already exist as Worker secrets.
 3. Run the validation commands above.
 4. Deploy with `npm run deploy`.
-5. Call authenticated `GET /health`.
+5. Call public `GET /health`.
 6. Call `POST /ingest-url` with a small known public image; confirm the returned
    URL uses the canonical custom domain and the staging prefix is empty.
 7. Call `POST /from-post` for a test Post and confirm Notion stores only the

@@ -7,11 +7,15 @@ import {
 import {
   assertR2Config,
   ingestSourceToR2,
+  isR2Configured,
   validateIngestUrlInput,
 } from "./r2-ingestion.js";
 
 const NOTION_VERSION = "2025-09-03";
 const SCHEMA_CACHE_TTL_MS = 5 * 60 * 1000;
+const MAX_NOTION_QUERY_PAGES = 10;
+const SOURCE_POST_RELATION_ATTEMPTS = 3;
+const MAX_INLINE_NOTION_RELATIONS = 25;
 
 const DEFAULT_MEDIA_ASSET_PROPS = {
   assetType: "Image",
@@ -71,6 +75,7 @@ const DESTINATION_FIELD_ALIASES = Object.freeze({
 });
 
 const mediaAssetsSchemaCache = new Map();
+const sourcePostRelationLocks = new Map();
 
 export default {
   async fetch(request, env) {
@@ -81,16 +86,16 @@ export default {
     const url = new URL(request.url);
 
     try {
-      await assertAuthorized(request, env);
-      assertConfig(env);
-
       if (url.pathname === "/health" && request.method === "GET") {
         return jsonResponse({
           ok: true,
           service: "media-assets-worker",
-          r2Configured: true,
+          r2Configured: isR2Configured(env),
         });
       }
+
+      await assertAuthorized(request, env);
+      assertConfig(env);
 
       if (url.pathname === "/test" && request.method === "GET") {
         const result = await createMediaAsset(env, {
@@ -267,69 +272,77 @@ async function createMediaAssetFromPost(env, postId) {
       record.sourceAsset,
       record.ingestion
     );
-    const canonicalRow = await findExistingMediaAssetByUrl(
+    const canonicalRows = await findExistingMediaAssetsByUrl(
       env,
       schema,
       asset.url
     );
-    let legacyRow = null;
-    if (!canonicalRow) {
-      for (const candidate of recordsByCanonicalKey.get(record.ingestion.key)) {
-        if (candidate.sourceAsset.url === asset.url) continue;
-        legacyRow = await findExistingMediaAsset(
-          env,
-          schema,
-          simplifiedPost,
-          candidate.sourceAsset
-        );
-        if (legacyRow) break;
+    const canonicalIds = new Set(canonicalRows.map((page) => page.id));
+    const legacyRowsById = new Map();
+    for (const candidate of recordsByCanonicalKey.get(record.ingestion.key)) {
+      if (candidate.sourceAsset.url === asset.url) continue;
+      const matches = await findExistingMediaAssets(
+        env,
+        schema,
+        simplifiedPost,
+        candidate.sourceAsset
+      );
+      for (const page of matches) {
+        if (!canonicalIds.has(page.id)) legacyRowsById.set(page.id, page);
       }
     }
-    const decision = decideMediaAssetRowAction({
-      canonicalRow,
-      legacyRow,
-    });
-    const notionAction =
-      decision.action === "create"
-        ? "created"
-        : decision.action === "update"
-          ? "updated"
-          : "existing";
-    let page;
-    let sourcePostLinked = false;
+    const legacyRows = [...legacyRowsById.values()].sort(comparePageIds);
+    const notionRows = [];
 
-    if (decision.action === "existing") {
+    for (const legacyRow of legacyRows) {
+      const migrated = await updateLegacyMediaAsset(
+        env,
+        destinationProperties,
+        legacyRow,
+        asset
+      );
       const linked = await ensureSourcePostRelation(
         env,
         destinationProperties,
-        decision.page,
+        migrated,
         simplifiedPost.id
       );
-      page = linked.page;
-      sourcePostLinked = linked.updated;
-      existing += 1;
-    } else if (decision.action === "update") {
-      page = await updateLegacyMediaAsset(
+      updated += 1;
+      notionRows.push(
+        summarizeReconciledRow(linked.page, "updated", linked.updated)
+      );
+    }
+
+    for (const canonicalRow of [...canonicalRows].sort(comparePageIds)) {
+      const linked = await ensureSourcePostRelation(
         env,
         destinationProperties,
-        decision.page,
-        asset
+        canonicalRow,
+        simplifiedPost.id
       );
-      updated += 1;
-    } else {
+      existing += 1;
+      notionRows.push(
+        summarizeReconciledRow(linked.page, "existing", linked.updated)
+      );
+    }
+
+    if (!notionRows.length) {
       const payload = buildFromPostMediaAssetPayload(
         env,
         simplifiedPost,
         destinationProperties,
         asset
       );
-      page = await notionFetch(env, "/v1/pages", {
+      const page = await notionFetch(env, "/v1/pages", {
         method: "POST",
         body: JSON.stringify(payload),
       });
       created += 1;
+      notionRows.push(summarizeReconciledRow(page, "created", false));
     }
 
+    const primary = notionRows[0];
+    const notionActions = [...new Set(notionRows.map((row) => row.action))];
     results.push({
       sourceUrl: record.sourceAsset.url,
       url: asset.url,
@@ -337,13 +350,18 @@ async function createMediaAssetFromPost(env, postId) {
       r2Action: record.ingestion.r2Action,
       r2Reused: record.ingestion.r2Reused,
       r2Uploaded: record.ingestion.r2Uploaded,
-      notionAction,
-      sourcePostLinked,
-      created: decision.action === "create",
-      updated: decision.action === "update",
-      existing: decision.action === "existing",
-      id: page.id,
-      rowUrl: page.url,
+      stagingResumed: record.ingestion.stagingResumed,
+      notionAction:
+        notionActions.length === 1 ? notionActions[0] : "reconciled",
+      notionActions,
+      notionRows,
+      reconciledRowIds: notionRows.map((row) => row.id),
+      sourcePostLinked: notionRows.some((row) => row.sourcePostLinked),
+      created: notionRows.some((row) => row.action === "created"),
+      updated: notionRows.some((row) => row.action === "updated"),
+      existing: notionRows.some((row) => row.action === "existing"),
+      id: primary.id,
+      rowUrl: primary.rowUrl,
       sourceKind: asset.sourceKind,
       sourceIndex: asset.sourceIndex,
     });
@@ -379,43 +397,55 @@ async function getMediaAssetsSchema(env) {
   return schema;
 }
 
-async function findExistingMediaAsset(env, schema, post, asset) {
+async function findExistingMediaAssets(env, schema, post, asset) {
   const properties = schema.properties || {};
   const filter = buildExistingMediaAssetFilter(
     properties,
     post.id,
     asset.url
   );
-  if (!filter) return null;
-
-  const query = await notionFetch(
-    env,
-    `/v1/data_sources/${env.MEDIA_ASSETS_DATA_SOURCE_ID}/query`,
-    {
-      method: "POST",
-      body: JSON.stringify({ filter, page_size: 1 }),
-    }
-  );
-
-  return query.results?.[0] || null;
+  if (!filter) return [];
+  return queryMediaAssetRows(env, filter);
 }
 
-async function findExistingMediaAssetByUrl(env, schema, cloudflareUrl) {
+async function findExistingMediaAssetsByUrl(env, schema, cloudflareUrl) {
   const filter = buildCanonicalMediaAssetFilter(
     schema.properties || {},
     cloudflareUrl
   );
-  if (!filter) return null;
+  if (!filter) return [];
+  return queryMediaAssetRows(env, filter);
+}
 
-  const query = await notionFetch(
-    env,
-    `/v1/data_sources/${env.MEDIA_ASSETS_DATA_SOURCE_ID}/query`,
-    {
-      method: "POST",
-      body: JSON.stringify({ filter, page_size: 1 }),
+async function queryMediaAssetRows(env, filter) {
+  const results = [];
+  let startCursor;
+
+  for (let page = 0; page < MAX_NOTION_QUERY_PAGES; page += 1) {
+    const query = await notionFetch(
+      env,
+      `/v1/data_sources/${env.MEDIA_ASSETS_DATA_SOURCE_ID}/query`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          filter,
+          page_size: 100,
+          ...(startCursor ? { start_cursor: startCursor } : {}),
+        }),
+      }
+    );
+    results.push(...(query.results || []));
+    if (!query.has_more) return uniquePages(results);
+    if (!query.next_cursor) {
+      throw httpError(502, "Notion pagination did not return a cursor.");
     }
+    startCursor = query.next_cursor;
+  }
+
+  throw httpError(
+    409,
+    "Media Assets query exceeded the safe reconciliation page limit."
   );
-  return query.results?.[0] || null;
 }
 
 async function updateLegacyMediaAsset(
@@ -440,54 +470,137 @@ async function ensureSourcePostRelation(
   page,
   postId
 ) {
-  const properties = buildSourcePostRelationUpdate(
-    destinationSchema,
-    page,
-    postId
-  );
-  if (!properties) return { page, updated: false };
-
-  const updatedPage = await notionFetch(env, `/v1/pages/${page.id}`, {
-    method: "PATCH",
-    body: JSON.stringify({ properties }),
-  });
-  return { page: updatedPage, updated: true };
-}
-
-export function buildSourcePostRelationUpdate(
-  destinationSchema,
-  page,
-  postId
-) {
   const sourcePost = findSchemaProperty(
     destinationSchema,
     DESTINATION_FIELD_ALIASES.sourcePost,
     "relation"
   );
-  const current = sourcePost
-    ? page.properties?.[sourcePost.name]
-    : null;
-  if (!sourcePost || !current || !Array.isArray(current.relation)) {
-    return null;
+  if (!sourcePost) return { page, updated: false };
+
+  return withSourcePostRelationLock(page.id, () =>
+    convergeSourcePostRelation({
+      postId,
+      relationName: sourcePost.name,
+      readPage: () => notionFetch(env, `/v1/pages/${page.id}`),
+      patchPage: (relationIds) =>
+        notionFetch(env, `/v1/pages/${page.id}`, {
+          method: "PATCH",
+          body: JSON.stringify({
+            properties: {
+              [sourcePost.name]: {
+                relation: relationIds.map((id) => ({ id })),
+              },
+            },
+          }),
+        }),
+    })
+  );
+}
+
+export function mergeRelationIds(currentIds, requiredIds) {
+  const merged = new Set();
+  for (const id of [...currentIds, ...requiredIds]) {
+    if (typeof id === "string" && id) merged.add(id);
   }
-  if (current.relation.some((relation) => relation.id === postId)) {
-    return null;
-  }
-  if (current.has_more) {
-    throw httpError(
-      409,
-      "Existing canonical Media Asset has too many Source Post relations to update safely."
-    );
+  return [...merged];
+}
+
+export async function convergeSourcePostRelation({
+  postId,
+  relationName,
+  readPage,
+  patchPage,
+  maxAttempts = SOURCE_POST_RELATION_ATTEMPTS,
+}) {
+  let updated = false;
+  let requiredIds = [];
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const currentPage = await readPage();
+    const current = relationIdsFromPage(currentPage, relationName);
+    requiredIds = mergeRelationIds(requiredIds, current);
+    requiredIds = mergeRelationIds(requiredIds, [postId]);
+    if (requiredIds.every((id) => current.includes(id))) {
+      return { page: currentPage, updated, attempts: attempt };
+    }
+
+    const desired = requiredIds;
+    if (desired.length > MAX_INLINE_NOTION_RELATIONS) {
+      throw httpError(
+        409,
+        "Source Post relation is at the safe inline limit and was not modified."
+      );
+    }
+    await patchPage(desired);
+    updated = true;
+
+    const verifiedPage = await readPage();
+    const verified = relationIdsFromPage(verifiedPage, relationName);
+    requiredIds = mergeRelationIds(requiredIds, verified);
+    if (requiredIds.every((id) => verified.includes(id))) {
+      return { page: verifiedPage, updated, attempts: attempt };
+    }
   }
 
+  throw httpError(
+    409,
+    "Source Post relation changed concurrently and could not be converged safely."
+  );
+}
+
+async function withSourcePostRelationLock(pageId, operation) {
+  const previous = sourcePostRelationLocks.get(pageId) || Promise.resolve();
+  const current = previous.catch(() => undefined).then(operation);
+  sourcePostRelationLocks.set(pageId, current);
+
+  try {
+    return await current;
+  } finally {
+    if (sourcePostRelationLocks.get(pageId) === current) {
+      sourcePostRelationLocks.delete(pageId);
+    }
+  }
+}
+
+function relationIdsFromPage(page, relationName) {
+  const property = page.properties?.[relationName];
+  if (!property || !Array.isArray(property.relation)) {
+    throw httpError(
+      502,
+      `Notion page did not return the ${relationName} relation.`
+    );
+  }
+  if (property.has_more) {
+    throw httpError(
+      409,
+      "Existing Media Asset has too many Source Post relations to update safely."
+    );
+  }
+  return mergeRelationIds(
+    property.relation.map((relation) => relation.id),
+    []
+  );
+}
+
+function summarizeReconciledRow(page, action, sourcePostLinked) {
   return {
-    [sourcePost.name]: {
-      relation: [
-        ...current.relation.map(({ id }) => ({ id })),
-        { id: postId },
-      ],
-    },
+    id: page.id,
+    rowUrl: page.url,
+    action,
+    sourcePostLinked,
   };
+}
+
+function uniquePages(pages) {
+  const unique = new Map();
+  for (const page of pages) {
+    if (page?.id) unique.set(page.id, page);
+  }
+  return [...unique.values()];
+}
+
+function comparePageIds(left, right) {
+  return String(left.id).localeCompare(String(right.id));
 }
 
 function buildCanonicalPostAsset(sourceAsset, ingestion) {
@@ -509,12 +622,6 @@ function buildCanonicalPostAsset(sourceAsset, ingestion) {
     size: ingestion.size,
     contentType: ingestion.contentType,
   };
-}
-
-export function decideMediaAssetRowAction({ canonicalRow, legacyRow }) {
-  if (canonicalRow) return { action: "existing", page: canonicalRow };
-  if (legacyRow) return { action: "update", page: legacyRow };
-  return { action: "create", page: null };
 }
 
 export function buildExistingMediaAssetFilter(

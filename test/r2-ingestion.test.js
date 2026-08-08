@@ -3,7 +3,10 @@ import { createHash } from "node:crypto";
 import test from "node:test";
 
 import { CANONICAL_R2_ORIGIN, IMAGE_MAX_BYTES } from "../src/media-ingestion.js";
-import { ingestSourceToR2 } from "../src/r2-ingestion.js";
+import {
+  ingestSourceToR2,
+  stagingPrefixForSource,
+} from "../src/r2-ingestion.js";
 import { MemoryR2Bucket } from "./helpers/memory-r2.js";
 
 const PNG_BYTES = Uint8Array.from([
@@ -187,12 +190,20 @@ test("treats a compatible canonical object from a concurrent writer as reused", 
     2,
     4
   )}/${hash}.png`;
-  bucket.put = async () => {
-    bucket.seed(key, PNG_BYTES, {
-      httpMetadata: { contentType: "image/png" },
-      customMetadata: { sha256: hash },
-    });
-    throw new Error("mock concurrent write collision");
+  const createMultipartUpload = bucket.createMultipartUpload.bind(bucket);
+  bucket.createMultipartUpload = async (uploadKey, options) => {
+    const upload = await createMultipartUpload(uploadKey, options);
+    if (uploadKey !== key) return upload;
+    return {
+      ...upload,
+      async uploadPart() {
+        bucket.seed(key, PNG_BYTES, {
+          httpMetadata: { contentType: "image/png" },
+          customMetadata: { sha256: hash },
+        });
+        throw new Error("mock concurrent write collision");
+      },
+    };
   };
 
   const result = await ingestSourceToR2(
@@ -203,6 +214,197 @@ test("treats a compatible canonical object from a concurrent writer as reused", 
 
   assert.equal(result.r2Action, "reused");
   assert.deepEqual(bucket.stagingKeys(), []);
+});
+
+test("preserves completed staging after promotion failure and resumes without source fetch", async () => {
+  const bucket = new MemoryR2Bucket();
+  const hash = createHash("sha256").update(PNG_BYTES).digest("hex");
+  const key = `images/sha256/${hash.slice(0, 2)}/${hash.slice(
+    2,
+    4
+  )}/${hash}.png`;
+  bucket.failMultipartForKey = key;
+  bucket.failUploadPartAt = 1;
+
+  await assert.rejects(
+    ingestSourceToR2(
+      testEnv(bucket),
+      { sourceUrl: "https://assets.example.com/retry.png" },
+      { fetchImpl: async () => sourceResponse(PNG_BYTES, "image/png") }
+    ),
+    (error) =>
+      error.status === 503 &&
+      error.details.code === "R2_CANONICAL_PROMOTION_RETRYABLE" &&
+      error.details.retryable === true &&
+      error.details.stagingKey.startsWith("imports/staging/src-")
+  );
+
+  assert.equal(bucket.stagingKeys().length, 1);
+  assert.equal(bucket.multipartUploads[0].completed, true);
+  assert.equal(bucket.multipartUploads[1].aborted, true);
+
+  bucket.failMultipartForKey = null;
+  bucket.failUploadPartAt = null;
+  const result = await ingestSourceToR2(
+    testEnv(bucket),
+    { sourceUrl: "https://assets.example.com/retry.png" },
+    {
+      fetchImpl: async () => {
+        throw new Error("retry must use preserved R2 staging");
+      },
+    }
+  );
+
+  assert.equal(result.r2Action, "uploaded");
+  assert.equal(result.stagingResumed, true);
+  assert.deepEqual(bucket.stagingKeys(), []);
+  assert.equal((await bucket.head(key)).size, PNG_BYTES.byteLength);
+});
+
+test("successful retry deletes only the staging object it verified", async () => {
+  const bucket = new MemoryR2Bucket();
+  const sourceUrl = "https://assets.example.com/concurrent-retries.png";
+  const prefix = stagingPrefixForSource(sourceUrl);
+  bucket.seed(`${prefix}attempt-a`, PNG_BYTES, {
+    httpMetadata: { contentType: "image/png" },
+    customMetadata: { "upload-id": "attempt-a" },
+  });
+  bucket.seed(`${prefix}attempt-b`, PNG_BYTES, {
+    httpMetadata: { contentType: "image/png" },
+    customMetadata: { "upload-id": "attempt-b" },
+  });
+
+  const first = await ingestSourceToR2(
+    testEnv(bucket),
+    { sourceUrl },
+    {
+      fetchImpl: async () => {
+        throw new Error("preserved staging should avoid source fetch");
+      },
+    }
+  );
+  assert.equal(first.stagingResumed, true);
+  assert.deepEqual(bucket.stagingKeys(), [`${prefix}attempt-b`]);
+
+  const second = await ingestSourceToR2(
+    testEnv(bucket),
+    { sourceUrl },
+    {
+      fetchImpl: async () => {
+        throw new Error("second preserved staging should avoid source fetch");
+      },
+    }
+  );
+  assert.equal(second.r2Action, "reused");
+  assert.deepEqual(bucket.stagingKeys(), []);
+});
+
+test("post-copy HEAD failure is retryable and preserves completed staging", async () => {
+  const bucket = new MemoryR2Bucket();
+  const hash = createHash("sha256").update(PNG_BYTES).digest("hex");
+  const key = `images/sha256/${hash.slice(0, 2)}/${hash.slice(
+    2,
+    4
+  )}/${hash}.png`;
+  const head = bucket.head.bind(bucket);
+  let canonicalHeads = 0;
+  bucket.head = async (requestedKey) => {
+    if (requestedKey === key) {
+      canonicalHeads += 1;
+      if (canonicalHeads >= 2) throw new Error("mock transient HEAD failure");
+    }
+    return head(requestedKey);
+  };
+
+  await assert.rejects(
+    ingestSourceToR2(
+      testEnv(bucket),
+      { sourceUrl: "https://assets.example.com/head-retry.png" },
+      { fetchImpl: async () => sourceResponse(PNG_BYTES, "image/png") }
+    ),
+    (error) =>
+      error.status === 503 &&
+      error.details.code === "R2_CANONICAL_PROMOTION_RETRYABLE" &&
+      error.details.retryable === true &&
+      error.details.stagingKey.startsWith("imports/staging/src-")
+  );
+  assert.equal(bucket.stagingKeys().length, 1);
+});
+
+test("source multipart writes cannot outlive the staging phase deadline", async () => {
+  const bucket = new MemoryR2Bucket();
+  const createMultipartUpload = bucket.createMultipartUpload.bind(bucket);
+  const originalNow = Date.now;
+  let now = 1_000;
+  Date.now = () => now;
+  bucket.createMultipartUpload = async (key, options) => {
+    const upload = await createMultipartUpload(key, options);
+    if (!key.startsWith("imports/staging/")) return upload;
+    const uploadPart = upload.uploadPart.bind(upload);
+    upload.uploadPart = (...args) => {
+      now += 30 * 60 * 1000 + 1;
+      return uploadPart(...args);
+    };
+    return upload;
+  };
+
+  try {
+    await assert.rejects(
+      ingestSourceToR2(
+        testEnv(bucket),
+        { sourceUrl: "https://assets.example.com/slow-staging.png" },
+        { fetchImpl: async () => sourceResponse(PNG_BYTES, "image/png") }
+      ),
+      (error) =>
+        error.status === 504 &&
+        error.details.code === "SOURCE_OVERALL_TIMEOUT"
+    );
+    assert.equal(bucket.multipartUploads[0].aborted, true);
+    assert.deepEqual(bucket.stagingKeys(), []);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+test("canonical multipart writes cannot outlive the promotion phase deadline", async () => {
+  const bucket = new MemoryR2Bucket();
+  const hash = createHash("sha256").update(PNG_BYTES).digest("hex");
+  const key = `images/sha256/${hash.slice(0, 2)}/${hash.slice(
+    2,
+    4
+  )}/${hash}.png`;
+  const createMultipartUpload = bucket.createMultipartUpload.bind(bucket);
+  const originalNow = Date.now;
+  let now = 1_000;
+  Date.now = () => now;
+  bucket.createMultipartUpload = async (uploadKey, options) => {
+    const upload = await createMultipartUpload(uploadKey, options);
+    if (uploadKey !== key) return upload;
+    const uploadPart = upload.uploadPart.bind(upload);
+    upload.uploadPart = (...args) => {
+      now += 30 * 60 * 1000 + 1;
+      return uploadPart(...args);
+    };
+    return upload;
+  };
+
+  try {
+    await assert.rejects(
+      ingestSourceToR2(
+        testEnv(bucket),
+        { sourceUrl: "https://assets.example.com/slow-promotion.png" },
+        { fetchImpl: async () => sourceResponse(PNG_BYTES, "image/png") }
+      ),
+      (error) =>
+        error.status === 503 &&
+        error.details.code === "R2_CANONICAL_PROMOTION_RETRYABLE" &&
+        error.details.during === "R2_CANONICAL_PROMOTION_TIMEOUT"
+    );
+    assert.equal(bucket.multipartUploads[1].aborted, true);
+    assert.equal(bucket.stagingKeys().length, 1);
+  } finally {
+    Date.now = originalNow;
+  }
 });
 
 test("prechecks oversized image Content-Length before staging", async () => {

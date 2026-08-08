@@ -5,6 +5,7 @@ export class MemoryR2Bucket {
     this.deletedKeys = [];
     this.putKeys = [];
     this.failUploadPartAt = null;
+    this.failMultipartForKey = null;
   }
 
   seed(key, bytes, options = {}) {
@@ -41,16 +42,32 @@ export class MemoryR2Bucket {
   }
 
   async delete(key) {
-    this.deletedKeys.push(key);
-    this.objects.delete(key);
+    const keys = Array.isArray(key) ? key : [key];
+    this.deletedKeys.push(...keys);
+    for (const item of keys) this.objects.delete(item);
   }
 
-  async createMultipartUpload(key) {
+  async list(options = {}) {
+    const prefix = options.prefix || "";
+    const objects = [...this.objects.entries()]
+      .filter(([key]) => key.startsWith(prefix))
+      .sort(([left], [right]) => left.localeCompare(right))
+      .slice(0, options.limit || 1000)
+      .map(([key, object]) => objectMetadata(key, object));
+    return {
+      objects,
+      truncated: false,
+      delimitedPrefixes: [],
+    };
+  }
+
+  async createMultipartUpload(key, options = {}) {
     const record = {
       key,
       parts: new Map(),
       aborted: false,
       completed: false,
+      options,
     };
     this.multipartUploads.push(record);
     const bucket = this;
@@ -59,7 +76,11 @@ export class MemoryR2Bucket {
       key,
       uploadId: `mock-upload-${this.multipartUploads.length}`,
       async uploadPart(partNumber, value) {
-        if (bucket.failUploadPartAt === partNumber) {
+        if (
+          bucket.failUploadPartAt === partNumber &&
+          (!bucket.failMultipartForKey ||
+            bucket.failMultipartForKey === key)
+        ) {
           throw new Error("mock upload failure");
         }
         const bytes = await readBytes(value);
@@ -76,7 +97,14 @@ export class MemoryR2Bucket {
           offset += chunk.byteLength;
         }
         record.completed = true;
-        bucket.objects.set(key, storedObject(bytes));
+        bucket.objects.set(
+          key,
+          storedObject(
+            bytes,
+            options.httpMetadata,
+            options.customMetadata
+          )
+        );
         return objectMetadata(key, bucket.objects.get(key));
       },
       async abort() {

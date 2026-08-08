@@ -7,8 +7,7 @@ import worker, {
   buildExistingMediaAssetFilter,
   buildFromPostMediaAssetPayload,
   buildPostAssets,
-  buildSourcePostRelationUpdate,
-  decideMediaAssetRowAction,
+  convergeSourcePostRelation,
   extractStableAssetUrls,
   qualifyPostFields,
   simplifyPostPage,
@@ -315,22 +314,7 @@ test("dedupe filter always includes exact URL and optionally Source Post", () =>
   assert.equal(withoutUrl, null);
 });
 
-test("row decisions prefer canonical rows and legacy updates only managed fields", () => {
-  const canonicalRow = { id: "canonical" };
-  const legacyRow = { id: "legacy" };
-  assert.deepEqual(
-    decideMediaAssetRowAction({ canonicalRow, legacyRow }),
-    { action: "existing", page: canonicalRow }
-  );
-  assert.deepEqual(
-    decideMediaAssetRowAction({ canonicalRow: null, legacyRow }),
-    { action: "update", page: legacyRow }
-  );
-  assert.deepEqual(
-    decideMediaAssetRowAction({ canonicalRow: null, legacyRow: null }),
-    { action: "create", page: null }
-  );
-
+test("legacy row updates include only managed canonical fields", () => {
   const properties = buildCanonicalMediaAssetUpdateProperties(
     destinationSchema(),
     {
@@ -354,25 +338,72 @@ test("row decisions prefer canonical rows and legacy updates only managed fields
     select: { name: "Rednote post" },
   });
 
-  assert.deepEqual(
-    buildSourcePostRelationUpdate(
-      destinationSchema(),
-      {
+});
+
+test("relation convergence retries with the union after a concurrent overwrite", async () => {
+  let relationIds = ["base-post"];
+  let patches = 0;
+  const page = () => ({
+    id: "canonical-row",
+    url: "https://www.notion.so/canonical-row",
+    properties: {
+      "Source Post": {
+        relation: relationIds.map((id) => ({ id })),
+        has_more: false,
+      },
+    },
+  });
+
+  const result = await convergeSourcePostRelation({
+    postId: POST_ID,
+    relationName: "Source Post",
+    readPage: async () => page(),
+    patchPage: async (desired) => {
+      patches += 1;
+      relationIds =
+        patches === 1
+          ? [POST_ID, "concurrent-post"]
+          : desired;
+      return page();
+    },
+  });
+
+  assert.equal(result.attempts, 2);
+  assert.equal(patches, 2);
+  assert.deepEqual(relationIds, [
+    "base-post",
+    POST_ID,
+    "concurrent-post",
+  ]);
+});
+
+test("relation convergence refuses to overflow the readable relation snapshot", async () => {
+  const relationIds = Array.from(
+    { length: 25 },
+    (_, index) => `post-${index + 1}`
+  );
+  let patches = 0;
+
+  await assert.rejects(
+    convergeSourcePostRelation({
+      postId: POST_ID,
+      relationName: "Source Post",
+      readPage: async () => ({
+        id: "full-row",
         properties: {
           "Source Post": {
-            relation: [{ id: "another-post" }],
+            relation: relationIds.map((id) => ({ id })),
             has_more: false,
           },
         },
+      }),
+      patchPage: async () => {
+        patches += 1;
       },
-      POST_ID
-    ),
-    {
-      "Source Post": {
-        relation: [{ id: "another-post" }, { id: POST_ID }],
-      },
-    }
+    }),
+    (error) => error.status === 409 && /safe inline limit/.test(error.message)
   );
+  assert.equal(patches, 0);
 });
 
 test("POST /from-post ingests to R2, updates a legacy row, and reuses canonical rows", async () => {
@@ -387,13 +418,14 @@ test("POST /from-post ingests to R2, updates a legacy row, and reuses canonical 
   const videoBytes = isoBaseMedia("isom");
   const imageUrl = canonicalUrlForBytes(imageBytes, "images", "png");
   const videoUrl = canonicalUrlForBytes(videoBytes, "videos", "mp4");
-  const existingRows = new Map([
+  const rowsById = new Map([
     [
-      "https://assets.example.com/a.png",
-      {
-        id: "legacy-row",
-        url: "https://www.notion.so/legacy-row",
-      },
+      "legacy-row",
+      notionMediaRow(
+        "legacy-row",
+        "https://assets.example.com/a.png",
+        [POST_ID]
+      ),
     ],
   ]);
 
@@ -435,18 +467,35 @@ test("POST /from-post ingests to R2, updates a legacy row, and reuses canonical 
       const assetUrl = body.filter.and
         ? body.filter.and[1].url.equals
         : body.filter.url.equals;
+      const requiredPost = body.filter.and
+        ? body.filter.and[0].relation.contains
+        : null;
+      const results = [...rowsById.values()].filter((page) => {
+        const matchesUrl =
+          page.properties["Cloudflare URL"]?.url === assetUrl;
+        const matchesPost =
+          !requiredPost ||
+          page.properties["Source Post"].relation.some(
+            (relation) => relation.id === requiredPost
+          );
+        return matchesUrl && matchesPost;
+      });
       return notionResponse({
-        results: existingRows.has(assetUrl) ? [existingRows.get(assetUrl)] : [],
+        results,
+        has_more: false,
       });
     }
-    if (path === "/v1/pages/legacy-row" && init.method === "PATCH") {
+    const pageMatch = path.match(/^\/v1\/pages\/([^/]+)$/);
+    if (pageMatch && (init.method || "GET") === "GET") {
+      const page = rowsById.get(pageMatch[1]);
+      if (page) return notionResponse(page);
+    }
+    if (pageMatch && init.method === "PATCH") {
       const body = JSON.parse(init.body);
       updateBodies.push(body);
-      const page = {
-        id: "legacy-row",
-        url: "https://www.notion.so/legacy-row",
-      };
-      existingRows.set(body.properties["Cloudflare URL"].url, page);
+      const page = rowsById.get(pageMatch[1]);
+      page.properties = { ...page.properties, ...body.properties };
+      rowsById.set(page.id, page);
       return notionResponse(page);
     }
     if (path === "/v1/pages" && init.method === "POST") {
@@ -455,8 +504,9 @@ test("POST /from-post ingests to R2, updates a legacy row, and reuses canonical 
       const page = {
         id: "created-row",
         url: "https://www.notion.so/created-row",
+        properties: body.properties,
       };
-      existingRows.set(body.properties["Cloudflare URL"].url, page);
+      rowsById.set(page.id, page);
       return notionResponse(page);
     }
     throw new Error(`Unexpected Notion request: ${init.method || "GET"} ${path}`);
@@ -484,7 +534,7 @@ test("POST /from-post ingests to R2, updates a legacy row, and reuses canonical 
     const response = await callFromPost();
     const body = await response.json();
 
-    assert.equal(response.status, 200);
+    assert.equal(response.status, 200, JSON.stringify(body));
     assert.deepEqual(
       {
         ok: body.ok,
@@ -560,7 +610,7 @@ test("POST /from-post ingests to R2, updates a legacy row, and reuses canonical 
         { r2Action: "reused", notionAction: "existing" },
       ]
     );
-    assert.equal(queryBodies.length, 6);
+    assert.equal(queryBodies.length, 8);
     assert.equal(
       queryBodies[1].filter.and[1].url.equals,
       "https://assets.example.com/a.png"
@@ -582,10 +632,189 @@ test("POST /from-post ingests to R2, updates a legacy row, and reuses canonical 
       select: { name: "Uploaded to Cloudflare" },
     });
     assert.deepEqual(bucket.stagingKeys(), []);
-    assert.deepEqual(new Set(bucket.putKeys), new Set([
-      imageUrl.slice(`${CANONICAL_R2_ORIGIN}/`.length),
-      videoUrl.slice(`${CANONICAL_R2_ORIGIN}/`.length),
-    ]));
+    assert.ok(
+      await bucket.head(imageUrl.slice(`${CANONICAL_R2_ORIGIN}/`.length))
+    );
+    assert.ok(
+      await bucket.head(videoUrl.slice(`${CANONICAL_R2_ORIGIN}/`.length))
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("POST /from-post reconciles every legacy row that collapses to one canonical object", async () => {
+  const originalFetch = globalThis.fetch;
+  const bucket = new MemoryR2Bucket();
+  const bytes = Uint8Array.from([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 7,
+  ]);
+  const canonicalUrl = canonicalUrlForBytes(bytes, "images", "png");
+  const rowsById = new Map([
+    [
+      "legacy-a",
+      {
+        ...notionMediaRow(
+          "legacy-a",
+          "https://assets.example.com/a.png",
+          [POST_ID]
+        ),
+        properties: {
+          ...notionMediaRow(
+            "legacy-a",
+            "https://assets.example.com/a.png",
+            [POST_ID]
+          ).properties,
+          Notes: { type: "rich_text", rich_text: [{ plain_text: "Keep A" }] },
+        },
+      },
+    ],
+    [
+      "legacy-b",
+      {
+        ...notionMediaRow(
+          "legacy-b",
+          "https://cdn.example.com/b.png",
+          [POST_ID]
+        ),
+        properties: {
+          ...notionMediaRow(
+            "legacy-b",
+            "https://cdn.example.com/b.png",
+            [POST_ID]
+          ).properties,
+          Notes: { type: "rich_text", rich_text: [{ plain_text: "Keep B" }] },
+        },
+      },
+    ],
+  ]);
+  const patchedIds = [];
+
+  globalThis.fetch = async (url, init = {}) => {
+    const parsedUrl = new URL(url);
+    const path = parsedUrl.pathname;
+    if (["assets.example.com", "cdn.example.com"].includes(parsedUrl.hostname)) {
+      return mediaResponse(bytes, "image/png");
+    }
+    if (path === `/v1/pages/${POST_ID}`) {
+      return notionResponse({
+        id: POST_ID,
+        url: `https://www.notion.so/${POST_ID}`,
+        properties: {
+          Headline: {
+            type: "title",
+            title: [{ plain_text: "Same bytes" }],
+          },
+          "Image URLs": {
+            type: "rich_text",
+            rich_text: [
+              {
+                plain_text:
+                  "https://assets.example.com/a.png https://cdn.example.com/b.png",
+              },
+            ],
+          },
+        },
+      });
+    }
+    if (path === "/v1/data_sources/legacy-convergence-source") {
+      return notionResponse({ properties: destinationSchema() });
+    }
+    if (path.endsWith("/query")) {
+      const body = JSON.parse(init.body);
+      const assetUrl = body.filter.and
+        ? body.filter.and[1].url.equals
+        : body.filter.url.equals;
+      return notionResponse({
+        results: [...rowsById.values()].filter(
+          (page) => page.properties["Cloudflare URL"].url === assetUrl
+        ),
+        has_more: false,
+      });
+    }
+    const pageMatch = path.match(/^\/v1\/pages\/([^/]+)$/);
+    if (pageMatch && (init.method || "GET") === "GET") {
+      return notionResponse(rowsById.get(pageMatch[1]));
+    }
+    if (pageMatch && init.method === "PATCH") {
+      const body = JSON.parse(init.body);
+      const page = rowsById.get(pageMatch[1]);
+      patchedIds.push(page.id);
+      page.properties = { ...page.properties, ...body.properties };
+      return notionResponse(page);
+    }
+    if (path === "/v1/pages" && init.method === "POST") {
+      throw new Error("All matching legacy rows should be migrated.");
+    }
+    throw new Error(`Unexpected request: ${init.method || "GET"} ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(
+      new Request("https://worker.example/from-post", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer test-key",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ postId: POST_ID }),
+      }),
+      {
+        NOTION_TOKEN: "test-token",
+        WORKER_API_KEY: "test-key",
+        MEDIA_ASSETS_DATA_SOURCE_ID: "legacy-convergence-source",
+        MEDIA_BUCKET: bucket,
+        R2_PUBLIC_BASE_URL: CANONICAL_R2_ORIGIN,
+      }
+    );
+    const body = await response.json();
+
+    assert.equal(response.status, 200, JSON.stringify(body));
+    assert.deepEqual(
+      {
+        sourceAssets: body.sourceAssets,
+        totalAssets: body.totalAssets,
+        updated: body.updated,
+        created: body.created,
+        deduplicated: body.deduplicated,
+      },
+      {
+        sourceAssets: 2,
+        totalAssets: 1,
+        updated: 2,
+        created: 0,
+        deduplicated: 1,
+      }
+    );
+    assert.deepEqual(body.results[0].reconciledRowIds, [
+      "legacy-a",
+      "legacy-b",
+    ]);
+    assert.deepEqual(
+      body.results[0].notionRows.map(({ id, action }) => ({ id, action })),
+      [
+        { id: "legacy-a", action: "updated" },
+        { id: "legacy-b", action: "updated" },
+      ]
+    );
+    assert.deepEqual(patchedIds.sort(), ["legacy-a", "legacy-b"]);
+    assert.equal(
+      rowsById.get("legacy-a").properties["Cloudflare URL"].url,
+      canonicalUrl
+    );
+    assert.equal(
+      rowsById.get("legacy-b").properties["Cloudflare URL"].url,
+      canonicalUrl
+    );
+    assert.equal(
+      rowsById.get("legacy-a").properties.Notes.rich_text[0].plain_text,
+      "Keep A"
+    );
+    assert.equal(
+      rowsById.get("legacy-b").properties.Notes.rich_text[0].plain_text,
+      "Keep B"
+    );
+    assert.equal(body.duplicates[0].reason, "duplicate-content");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -642,7 +871,7 @@ test("POST /ingest-url stores media without creating a Notion row", async () => 
   }
 });
 
-test("GET /health is authenticated and reports R2 readiness without details", async () => {
+test("GET /health remains public and reports R2 readiness without details", async () => {
   const env = {
     NOTION_TOKEN: "test-token",
     WORKER_API_KEY: "test-key",
@@ -662,13 +891,35 @@ test("GET /health is authenticated and reports R2 readiness without details", as
   );
   const body = await authorized.json();
 
-  assert.equal(unauthorized.status, 401);
+  assert.equal(unauthorized.status, 200);
   assert.equal(authorized.status, 200);
   assert.deepEqual(body, {
     ok: true,
     service: "media-assets-worker",
     r2Configured: true,
   });
+
+  const unconfigured = await worker.fetch(
+    new Request("https://worker.example/health"),
+    {}
+  );
+  assert.deepEqual(await unconfigured.json(), {
+    ok: true,
+    service: "media-assets-worker",
+    r2Configured: false,
+  });
+
+  const protectedResponse = await worker.fetch(
+    new Request("https://worker.example/ingest-url", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        sourceUrl: "https://assets.example.com/protected.png",
+      }),
+    }),
+    env
+  );
+  assert.equal(protectedResponse.status, 401);
 });
 
 test("metadata-only POST /media-assets cannot claim an R2 upload", async () => {
@@ -828,6 +1079,21 @@ function notionResponse(value, status = 200) {
     status,
     headers: { "Content-Type": "application/json" },
   });
+}
+
+function notionMediaRow(id, cloudflareUrl, sourcePostIds) {
+  return {
+    id,
+    url: `https://www.notion.so/${id}`,
+    properties: {
+      "Cloudflare URL": { type: "url", url: cloudflareUrl },
+      "Source Post": {
+        type: "relation",
+        relation: sourcePostIds.map((postId) => ({ id: postId })),
+        has_more: false,
+      },
+    },
+  };
 }
 
 function mediaResponse(bytes, contentType) {

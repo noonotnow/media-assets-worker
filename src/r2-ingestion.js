@@ -23,6 +23,8 @@ const MAX_REDIRECTS = 5;
 const SOURCE_CONNECT_TIMEOUT_MS = 30_000;
 const SOURCE_INACTIVITY_TIMEOUT_MS = 30_000;
 const SOURCE_OVERALL_TIMEOUT_MS = 30 * 60 * 1000;
+const CANONICAL_PART_UPLOAD_ATTEMPTS = 3;
+const STAGING_LIST_PAGE_LIMIT = 100;
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const SOURCE_HEADERS = Object.freeze({
   Accept:
@@ -69,6 +71,21 @@ export async function ingestSourceToR2(
   }
 
   const initialUrl = validatePublicHttpsUrl(source);
+  const stagingPrefix = stagingPrefixForSource(initialUrl.href);
+  const preservedStaging = await findPreservedStaging(
+    env.MEDIA_BUCKET,
+    stagingPrefix
+  );
+  if (preservedStaging) {
+    return resumeStagedPromotion(env, {
+      stagingObject: preservedStaging,
+      stagingPrefix,
+      sourceUrl: source,
+      postId,
+      kind,
+    });
+  }
+
   const fetchImpl = options.fetchImpl || globalThis.fetch;
   const sourceResponse = await fetchSourceWithRedirects(
     initialUrl,
@@ -115,9 +132,25 @@ export async function ingestSourceToR2(
     assertKindMatches(kind, declaredMediaType);
     precheckContentLength(contentLength, kind, declaredMediaType);
 
+    const stagingStartedAt = Date.now();
     uploadId = crypto.randomUUID();
-    stagingKey = `imports/staging/${uploadId}`;
-    multipart = await createMultipartUpload(env.MEDIA_BUCKET, stagingKey);
+    stagingKey = `${stagingPrefix}${uploadId}`;
+    multipart = await withPhaseDeadline(
+      createMultipartUpload(env.MEDIA_BUCKET, stagingKey, {
+        httpMetadata: {
+          contentType: declaredContentType || "application/octet-stream",
+        },
+        customMetadata: buildStagingMetadata({
+          sourceUrl: source,
+          sourceFingerprint: sourceFingerprint(initialUrl.href),
+          uploadId,
+          postId,
+        }),
+      }),
+      stagingStartedAt,
+      () => controller.abort(),
+      sourceOverallTimeoutError()
+    );
     reader = response.body?.getReader();
     if (!reader) {
       throw new MediaIngestionError(
@@ -131,7 +164,6 @@ export async function ingestSourceToR2(
     const prefix = new Uint8Array(MEDIA_SNIFF_BYTES);
     const partBuffer = new MultipartPartBuffer(MULTIPART_PART_BYTES);
     const uploadedParts = [];
-    const streamStartedAt = Date.now();
     let prefixLength = 0;
     let totalBytes = 0;
     let mediaType = null;
@@ -139,7 +171,12 @@ export async function ingestSourceToR2(
     let partNumber = 1;
 
     const uploadPart = async (bytes) => {
-      const part = await multipart.uploadPart(partNumber, bytes);
+      const part = await withPhaseDeadline(
+        multipart.uploadPart(partNumber, bytes),
+        stagingStartedAt,
+        () => controller.abort(),
+        sourceOverallTimeoutError()
+      );
       uploadedParts.push(part);
       partNumber += 1;
     };
@@ -148,7 +185,7 @@ export async function ingestSourceToR2(
       const { done, value } = await readSourceChunk(
         reader,
         controller,
-        streamStartedAt
+        stagingStartedAt
       );
       if (done) break;
 
@@ -204,7 +241,12 @@ export async function ingestSourceToR2(
     if (!totalBytes) throw unsupportedMediaError();
 
     await partBuffer.flush(uploadPart);
-    await multipart.complete(uploadedParts);
+    await withPhaseDeadline(
+      multipart.complete(uploadedParts),
+      stagingStartedAt,
+      () => controller.abort(),
+      sourceOverallTimeoutError()
+    );
     multipartCompleted = true;
 
     const hash = bytesToHex(hasher.digest());
@@ -213,7 +255,12 @@ export async function ingestSourceToR2(
       `${CANONICAL_R2_ORIGIN}/${key}`,
       env.R2_PUBLIC_BASE_URL
     );
-    const existing = await headCanonicalObject(env.MEDIA_BUCKET, canonicalTarget);
+    const existing = await headCanonicalForPromotion(
+      env.MEDIA_BUCKET,
+      canonicalTarget,
+      stagingKey,
+      stagingStartedAt
+    );
 
     let action;
     if (existing) {
@@ -233,6 +280,7 @@ export async function ingestSourceToR2(
       });
     }
 
+    await deleteStagingObject(env.MEDIA_BUCKET, stagingKey);
     return buildIngestionResult({
       sourceUrl: source,
       canonical: canonicalTarget,
@@ -240,6 +288,7 @@ export async function ingestSourceToR2(
       contentType: storageContentType,
       action,
       uploadId,
+      stagingResumed: false,
     });
   } catch (error) {
     primaryError = normalizeIngestionError(error);
@@ -268,7 +317,7 @@ export async function ingestSourceToR2(
         cleanupErrors.push("multipart-abort");
       }
     }
-    if (multipart) {
+    if (multipart && !multipartCompleted) {
       try {
         await env.MEDIA_BUCKET.delete(stagingKey);
       } catch {
@@ -330,45 +379,229 @@ export function validateIngestUrlInput(input) {
   };
 }
 
+export function stagingPrefixForSource(sourceUrl) {
+  return `imports/staging/src-${sourceFingerprint(sourceUrl)}-`;
+}
+
+export function isR2Configured(env) {
+  if (!hasR2Binding(env)) {
+    return false;
+  }
+
+  try {
+    const publicBase = new URL(env.R2_PUBLIC_BASE_URL);
+    return (
+      publicBase.origin === CANONICAL_R2_ORIGIN &&
+      publicBase.href === `${CANONICAL_R2_ORIGIN}/`
+    );
+  } catch {
+    return false;
+  }
+}
+
 export function assertR2Config(env) {
-  const requiredMethods = [
-    "head",
-    "get",
-    "put",
-    "delete",
-    "createMultipartUpload",
-  ];
-  if (
-    !env?.MEDIA_BUCKET ||
-    requiredMethods.some(
-      (method) => typeof env.MEDIA_BUCKET[method] !== "function"
-    )
-  ) {
+  if (!hasR2Binding(env)) {
     throw new MediaIngestionError(
       500,
       "MEDIA_BUCKET R2 binding is not configured.",
       "R2_BINDING_MISSING"
     );
   }
-
-  let publicBase;
-  try {
-    publicBase = new URL(env.R2_PUBLIC_BASE_URL);
-  } catch {
-    throw new MediaIngestionError(
-      500,
-      "R2_PUBLIC_BASE_URL is not configured correctly.",
-      "R2_PUBLIC_BASE_URL_INVALID"
-    );
-  }
-  if (
-    publicBase.origin !== CANONICAL_R2_ORIGIN ||
-    publicBase.href !== `${CANONICAL_R2_ORIGIN}/`
-  ) {
+  if (!isR2Configured(env)) {
     throw new MediaIngestionError(
       500,
       "R2_PUBLIC_BASE_URL must be the canonical media origin.",
       "R2_PUBLIC_BASE_URL_INVALID"
+    );
+  }
+}
+
+function hasR2Binding(env) {
+  const requiredMethods = [
+    "head",
+    "get",
+    "delete",
+    "list",
+    "createMultipartUpload",
+  ];
+  return Boolean(
+    env?.MEDIA_BUCKET &&
+      requiredMethods.every(
+        (method) => typeof env.MEDIA_BUCKET[method] === "function"
+      )
+  );
+}
+
+async function findPreservedStaging(bucket, stagingPrefix) {
+  let listed;
+  try {
+    listed = await bucket.list({
+      prefix: stagingPrefix,
+      limit: STAGING_LIST_PAGE_LIMIT,
+      include: ["httpMetadata", "customMetadata"],
+    });
+  } catch {
+    throw new MediaIngestionError(
+      503,
+      "Could not inspect retryable R2 staging.",
+      "R2_STAGING_LIST_RETRYABLE",
+      { retryable: true }
+    );
+  }
+
+  return [...(listed.objects || [])].sort((left, right) =>
+    left.key.localeCompare(right.key)
+  )[0] || null;
+}
+
+async function resumeStagedPromotion(
+  env,
+  { stagingObject, stagingPrefix, sourceUrl, postId, kind }
+) {
+  const inspected = await inspectStagingObject(
+    env.MEDIA_BUCKET,
+    stagingObject,
+    kind
+  );
+  const key = deriveCanonicalKey(inspected.sha256, inspected.mediaType);
+  const canonical = parseCanonicalMediaUrl(
+    `${CANONICAL_R2_ORIGIN}/${key}`,
+    env.R2_PUBLIC_BASE_URL
+  );
+  const existing = await headCanonicalForPromotion(
+    env.MEDIA_BUCKET,
+    canonical,
+    stagingObject.key
+  );
+  let action;
+  if (existing) {
+    validateCanonicalHead(canonical, existing, {
+      expectedSize: inspected.size,
+    });
+    action = "reused";
+  } else {
+    action = await promoteStagingObject(env.MEDIA_BUCKET, {
+      stagingKey: stagingObject.key,
+      canonical,
+      size: inspected.size,
+      contentType: inspected.contentType,
+      uploadId:
+        stagingObject.customMetadata?.["upload-id"] ||
+        stagingObject.key.slice(stagingPrefix.length),
+      postId,
+      sourceUrl,
+    });
+  }
+
+  await deleteStagingObject(env.MEDIA_BUCKET, stagingObject.key);
+  return buildIngestionResult({
+    sourceUrl,
+    canonical,
+    size: inspected.size,
+    contentType: inspected.contentType,
+    action,
+    uploadId: stagingObject.customMetadata?.["upload-id"] || null,
+    stagingResumed: true,
+  });
+}
+
+async function inspectStagingObject(bucket, stagingObject, kind) {
+  const startedAt = Date.now();
+  const staged = await getStagingObject(
+    bucket,
+    stagingObject.key,
+    stagingObject.size,
+    startedAt
+  );
+  const declaredContentType = staged.httpMetadata?.contentType || "";
+  const declaredMediaType = mediaTypeFromContentType(declaredContentType);
+  assertKindMatches(kind, declaredMediaType);
+  precheckContentLength(staged.size, kind, declaredMediaType);
+
+  const reader = staged.body.getReader();
+  const hasher = sha256.create();
+  const prefix = new Uint8Array(MEDIA_SNIFF_BYTES);
+  let prefixLength = 0;
+  let totalBytes = 0;
+  let mediaType = null;
+  let contentType = null;
+
+  try {
+    while (true) {
+      const { done, value } = await readInternalChunk(reader, startedAt);
+      if (done) break;
+      const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+      if (!chunk.byteLength) continue;
+      totalBytes += chunk.byteLength;
+      const provisionalLimit = provisionalByteLimit(
+        kind,
+        mediaType,
+        declaredMediaType
+      );
+      if (totalBytes > provisionalLimit) {
+        throw tooLargeError(kind || mediaType?.kind || declaredMediaType?.kind);
+      }
+      hasher.update(chunk);
+      if (prefixLength < prefix.byteLength) {
+        const copyLength = Math.min(
+          chunk.byteLength,
+          prefix.byteLength - prefixLength
+        );
+        prefix.set(chunk.subarray(0, copyLength), prefixLength);
+        prefixLength += copyLength;
+      }
+      if (!mediaType) {
+        mediaType = detectMediaType(prefix.subarray(0, prefixLength));
+        if (mediaType) {
+          assertKindMatches(kind, mediaType);
+          contentType = validateMediaContentType(
+            mediaType,
+            declaredContentType
+          );
+          assertByteLimit(staged.size, mediaType);
+        } else if (prefixLength === prefix.byteLength) {
+          throw unsupportedMediaError();
+        }
+      }
+    }
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {
+      // The completed staging stream may already be closed.
+    }
+  }
+
+  mediaType ||= detectMediaType(prefix.subarray(0, prefixLength));
+  if (!mediaType || totalBytes !== staged.size) {
+    throw new MediaIngestionError(
+      503,
+      "Completed R2 staging object could not be verified for retry.",
+      "R2_STAGING_VERIFY_RETRYABLE",
+      { retryable: true, stagingKey: stagingObject.key }
+    );
+  }
+  assertKindMatches(kind, mediaType);
+  contentType ||= validateMediaContentType(mediaType, declaredContentType);
+  assertByteLimit(totalBytes, mediaType);
+
+  return {
+    sha256: bytesToHex(hasher.digest()),
+    size: totalBytes,
+    mediaType,
+    contentType,
+  };
+}
+
+async function deleteStagingObject(bucket, stagingKey) {
+  try {
+    await bucket.delete(stagingKey);
+  } catch {
+    throw new MediaIngestionError(
+      503,
+      "Canonical media is verified, but retryable staging cleanup failed.",
+      "R2_STAGING_CLEANUP_RETRYABLE",
+      { retryable: true, stagingKey }
     );
   }
 }
@@ -485,9 +718,9 @@ async function readSourceChunk(reader, controller, startedAt) {
   );
 }
 
-async function createMultipartUpload(bucket, stagingKey) {
+async function createMultipartUpload(bucket, stagingKey, options) {
   try {
-    return await bucket.createMultipartUpload(stagingKey);
+    return await bucket.createMultipartUpload(stagingKey, options);
   } catch {
     throw new MediaIngestionError(
       502,
@@ -501,24 +734,6 @@ async function promoteStagingObject(
   bucket,
   { stagingKey, canonical, size, contentType, uploadId, postId, sourceUrl }
 ) {
-  let staged;
-  try {
-    staged = await bucket.get(stagingKey);
-  } catch {
-    throw new MediaIngestionError(
-      502,
-      "Could not read the completed R2 staging object.",
-      "R2_STAGING_READ_FAILED"
-    );
-  }
-  if (!staged?.body || staged.size !== size) {
-    throw new MediaIngestionError(
-      502,
-      "Completed R2 staging object failed verification.",
-      "R2_STAGING_VERIFY_FAILED"
-    );
-  }
-
   const customMetadata = {
     sha256: canonical.sha256,
     "upload-id": uploadId,
@@ -527,38 +742,250 @@ async function promoteStagingObject(
   const safeSourceUrl = safeSourceUrlMetadata(sourceUrl);
   if (safeSourceUrl) customMetadata["source-url"] = safeSourceUrl;
 
+  let destinationUpload = null;
+  let destinationCompleted = false;
+  let reader = null;
+  let promotionError = null;
+  const promotionStartedAt = Date.now();
   try {
-    const stored = await bucket.put(canonical.key, staged.body, {
-      httpMetadata: {
-        contentType,
-        cacheControl: "public, max-age=31536000, immutable",
-      },
-      customMetadata,
-    });
-    if (!stored) throw new Error("R2 put returned no object");
-  } catch {
-    const racedObject = await headCanonicalObject(bucket, canonical);
+    const staged = await getStagingObject(
+      bucket,
+      stagingKey,
+      size,
+      promotionStartedAt
+    );
+    reader = staged.body.getReader();
+    destinationUpload = await withPhaseDeadline(
+      bucket.createMultipartUpload(canonical.key, {
+        httpMetadata: {
+          contentType,
+          cacheControl: "public, max-age=31536000, immutable",
+        },
+        customMetadata,
+      }),
+      promotionStartedAt,
+      () => reader.cancel(),
+      promotionOverallTimeoutError(stagingKey)
+    );
+    const uploadedParts = [];
+    const partBuffer = new MultipartPartBuffer(MULTIPART_PART_BYTES);
+    let copiedBytes = 0;
+    let partNumber = 1;
+
+    const uploadPart = async (bytes) => {
+      const part = await uploadCanonicalPartWithRetry(
+        destinationUpload,
+        partNumber,
+        bytes,
+        promotionStartedAt,
+        stagingKey
+      );
+      uploadedParts.push(part);
+      partNumber += 1;
+    };
+
+    while (true) {
+      const { done, value } = await readInternalChunk(
+        reader,
+        promotionStartedAt
+      );
+      if (done) break;
+      const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+      copiedBytes += chunk.byteLength;
+      if (copiedBytes > size) {
+        throw new MediaIngestionError(
+          502,
+          "R2 staging object changed during canonical promotion.",
+          "R2_STAGING_SIZE_CHANGED"
+        );
+      }
+      await partBuffer.append(chunk, uploadPart);
+    }
+    if (copiedBytes !== size) {
+      throw new MediaIngestionError(
+        502,
+        "R2 staging object ended before canonical promotion completed.",
+        "R2_STAGING_SIZE_CHANGED"
+      );
+    }
+    await partBuffer.flush(uploadPart);
+    await withPhaseDeadline(
+      destinationUpload.complete(uploadedParts),
+      promotionStartedAt,
+      () => reader.cancel(),
+      promotionOverallTimeoutError(stagingKey)
+    );
+    destinationCompleted = true;
+
+    const promoted = await withPhaseDeadline(
+      headCanonicalObject(bucket, canonical),
+      promotionStartedAt,
+      () => undefined,
+      promotionOverallTimeoutError(stagingKey)
+    );
+    if (!promoted) {
+      throw new MediaIngestionError(
+        503,
+        "Canonical R2 object was absent after upload.",
+        "R2_CANONICAL_VERIFY_RETRYABLE"
+      );
+    }
+    validateCanonicalHead(canonical, promoted, { expectedSize: size });
+    return "uploaded";
+  } catch (error) {
+    promotionError = error;
+    let racedObject = null;
+    try {
+      racedObject = await withPhaseDeadline(
+        bucket.head(canonical.key),
+        promotionStartedAt,
+        () => undefined,
+        promotionOverallTimeoutError(stagingKey)
+      );
+    } catch {
+      // A transient HEAD failure is returned as a retryable promotion error.
+    }
     if (racedObject) {
-      validateCanonicalHead(canonical, racedObject, { expectedSize: size });
-      return "reused";
+      try {
+        validateCanonicalHead(canonical, racedObject, { expectedSize: size });
+      } catch (validationError) {
+        throw new MediaIngestionError(
+          409,
+          "Canonical R2 verification conflicted with completed staging.",
+          "R2_CANONICAL_VERIFY_CONFLICT",
+          {
+            retryable: false,
+            stagingKey,
+            during: validationError?.details?.code || null,
+          }
+        );
+      }
+      return destinationCompleted ? "uploaded" : "reused";
     }
     throw new MediaIngestionError(
-      502,
-      "Could not promote the staged media object in R2.",
-      "R2_CANONICAL_PUT_FAILED"
+      503,
+      "Canonical R2 promotion failed; completed staging was preserved for retry.",
+      "R2_CANONICAL_PROMOTION_RETRYABLE",
+      {
+        retryable: true,
+        stagingKey,
+        during: error?.details?.code || null,
+      }
     );
+  } finally {
+    try {
+      await reader?.cancel();
+    } catch {
+      // The R2 staging stream may already be closed.
+    }
+    if (destinationUpload && !destinationCompleted) {
+      try {
+        await destinationUpload.abort();
+      } catch {
+        throw new MediaIngestionError(
+          503,
+          "Canonical R2 promotion failed and destination cleanup could not be confirmed.",
+          "R2_CANONICAL_PROMOTION_ABORT_FAILED",
+          {
+            retryable: true,
+            stagingKey,
+            during: promotionError?.details?.code || null,
+          }
+        );
+      }
+    }
   }
+}
 
-  const promoted = await headCanonicalObject(bucket, canonical);
-  if (!promoted) {
+async function getStagingObject(
+  bucket,
+  stagingKey,
+  expectedSize,
+  phaseStartedAt = Date.now()
+) {
+  let staged;
+  try {
+    staged = await withPhaseDeadline(
+      bucket.get(stagingKey),
+      phaseStartedAt,
+      () => undefined,
+      stagingOverallTimeoutError(stagingKey)
+    );
+  } catch (error) {
+    if (error instanceof MediaIngestionError) throw error;
     throw new MediaIngestionError(
-      502,
-      "Canonical R2 object was absent after upload.",
-      "R2_CANONICAL_VERIFY_FAILED"
+      503,
+      "Could not read the completed R2 staging object.",
+      "R2_STAGING_READ_RETRYABLE",
+      { retryable: true, stagingKey }
     );
   }
-  validateCanonicalHead(canonical, promoted, { expectedSize: size });
-  return "uploaded";
+  if (
+    !staged?.body ||
+    (expectedSize !== undefined && staged.size !== expectedSize)
+  ) {
+    throw new MediaIngestionError(
+      503,
+      "Completed R2 staging object failed verification.",
+      "R2_STAGING_VERIFY_RETRYABLE",
+      { retryable: true, stagingKey }
+    );
+  }
+  return staged;
+}
+
+async function uploadCanonicalPartWithRetry(
+  upload,
+  partNumber,
+  bytes,
+  phaseStartedAt,
+  stagingKey
+) {
+  let lastError;
+  for (
+    let attempt = 1;
+    attempt <= CANONICAL_PART_UPLOAD_ATTEMPTS;
+    attempt += 1
+  ) {
+    try {
+      return await withPhaseDeadline(
+        upload.uploadPart(partNumber, bytes),
+        phaseStartedAt,
+        () => undefined,
+        promotionOverallTimeoutError(stagingKey)
+      );
+    } catch (error) {
+      if (error?.details?.code === "R2_CANONICAL_PROMOTION_TIMEOUT") {
+        throw error;
+      }
+      lastError = error;
+      if (attempt < CANONICAL_PART_UPLOAD_ATTEMPTS) {
+        await delay(25 * attempt);
+      }
+    }
+  }
+  throw lastError;
+}
+
+async function readInternalChunk(reader, startedAt = Date.now()) {
+  const remaining = SOURCE_OVERALL_TIMEOUT_MS - (Date.now() - startedAt);
+  if (remaining <= 0) {
+    throw new MediaIngestionError(
+      503,
+      "R2 staging operation exceeded the overall timeout.",
+      "R2_STAGING_OVERALL_TIMEOUT"
+    );
+  }
+  return withTimeout(
+    reader.read(),
+    Math.min(SOURCE_INACTIVITY_TIMEOUT_MS, remaining),
+    () => reader.cancel(),
+    new MediaIngestionError(
+      503,
+      "R2 staging copy stalled during canonical promotion.",
+      "R2_CANONICAL_COPY_TIMEOUT"
+    )
+  );
 }
 
 async function headCanonicalObject(bucket, canonical) {
@@ -569,6 +996,33 @@ async function headCanonicalObject(bucket, canonical) {
       502,
       "Could not validate the canonical R2 object.",
       "R2_HEAD_FAILED"
+    );
+  }
+}
+
+async function headCanonicalForPromotion(
+  bucket,
+  canonical,
+  stagingKey,
+  phaseStartedAt = Date.now()
+) {
+  try {
+    return await withPhaseDeadline(
+      headCanonicalObject(bucket, canonical),
+      phaseStartedAt,
+      () => undefined,
+      promotionOverallTimeoutError(stagingKey)
+    );
+  } catch (error) {
+    throw new MediaIngestionError(
+      503,
+      "Canonical R2 validation failed; completed staging was preserved for retry.",
+      "R2_CANONICAL_PROMOTION_RETRYABLE",
+      {
+        retryable: true,
+        stagingKey,
+        during: error?.details?.code || null,
+      }
     );
   }
 }
@@ -622,6 +1076,7 @@ function buildIngestionResult({
   contentType,
   action,
   uploadId = null,
+  stagingResumed = false,
 }) {
   return {
     sourceUrl,
@@ -639,6 +1094,7 @@ function buildIngestionResult({
     r2Reused: action === "reused",
     r2Uploaded: action === "uploaded",
     uploadId,
+    stagingResumed,
   };
 }
 
@@ -725,6 +1181,26 @@ function bytesToHex(bytes) {
   return output;
 }
 
+function sourceFingerprint(sourceUrl) {
+  return bytesToHex(sha256(new TextEncoder().encode(sourceUrl)));
+}
+
+function buildStagingMetadata({
+  sourceUrl,
+  sourceFingerprint: fingerprint,
+  uploadId,
+  postId,
+}) {
+  const metadata = {
+    "source-fingerprint": fingerprint,
+    "upload-id": uploadId,
+  };
+  if (postId) metadata["source-post-id"] = postId;
+  const safeSourceUrl = safeSourceUrlMetadata(sourceUrl);
+  if (safeSourceUrl) metadata["source-url"] = safeSourceUrl;
+  return metadata;
+}
+
 function normalizeIngestionError(error) {
   if (error instanceof MediaIngestionError) return error;
   return new MediaIngestionError(
@@ -734,6 +1210,51 @@ function normalizeIngestionError(error) {
   );
 }
 
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function sourceOverallTimeoutError() {
+  return new MediaIngestionError(
+    504,
+    "Source staging exceeded the overall timeout.",
+    "SOURCE_OVERALL_TIMEOUT"
+  );
+}
+
+function stagingOverallTimeoutError(stagingKey) {
+  return new MediaIngestionError(
+    503,
+    "R2 staging verification exceeded the overall timeout.",
+    "R2_STAGING_OVERALL_TIMEOUT",
+    { retryable: true, stagingKey }
+  );
+}
+
+function promotionOverallTimeoutError(stagingKey) {
+  return new MediaIngestionError(
+    503,
+    "Canonical R2 promotion exceeded the overall timeout.",
+    "R2_CANONICAL_PROMOTION_TIMEOUT",
+    { retryable: true, stagingKey }
+  );
+}
+
+async function withPhaseDeadline(
+  promise,
+  startedAt,
+  onTimeout,
+  timeoutError
+) {
+  const remaining = SOURCE_OVERALL_TIMEOUT_MS - (Date.now() - startedAt);
+  if (remaining <= 0) {
+    Promise.resolve(promise).catch(() => undefined);
+    runTimeoutAction(onTimeout);
+    throw timeoutError;
+  }
+  return withTimeout(promise, remaining, onTimeout, timeoutError);
+}
+
 async function withTimeout(promise, timeoutMs, onTimeout, timeoutError) {
   let timer;
   try {
@@ -741,13 +1262,21 @@ async function withTimeout(promise, timeoutMs, onTimeout, timeoutError) {
       promise,
       new Promise((_, reject) => {
         timer = setTimeout(() => {
-          onTimeout();
+          runTimeoutAction(onTimeout);
           reject(timeoutError);
         }, timeoutMs);
       }),
     ]);
   } finally {
     clearTimeout(timer);
+  }
+}
+
+function runTimeoutAction(action) {
+  try {
+    Promise.resolve(action()).catch(() => undefined);
+  } catch {
+    // Timeout cleanup is best effort; the primary timeout remains authoritative.
   }
 }
 
