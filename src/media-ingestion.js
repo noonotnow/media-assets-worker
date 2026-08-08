@@ -48,6 +48,14 @@ const MEDIA_TYPES = Object.freeze({
     notionFormat: null,
   }),
 });
+const QUICKTIME_MAJOR_MEDIA_TYPE = Object.freeze({
+  ...MEDIA_TYPES.mov,
+  isoMajorBrand: "qt  ",
+});
+const KNOWN_MEDIA_TYPES = new Set([
+  ...Object.values(MEDIA_TYPES),
+  QUICKTIME_MAJOR_MEDIA_TYPE,
+]);
 
 const MIME_TYPES = new Map([
   ["image/jpeg", MEDIA_TYPES.jpg],
@@ -377,6 +385,69 @@ export function mediaTypeFromContentType(value) {
 }
 
 export function validateMediaContentType(mediaType, declaredContentType) {
+  return resolveValidatedMediaType(
+    mediaType,
+    declaredContentType,
+    ""
+  ).contentType;
+}
+
+export function resolveValidatedMediaType(
+  detectedMediaType,
+  declaredContentType,
+  sourcePathname
+) {
+  if (!isKnownMediaType(detectedMediaType)) {
+    throw new MediaIngestionError(
+      415,
+      "Source bytes are not a supported media type.",
+      "UNSUPPORTED_MEDIA_SIGNATURE"
+    );
+  }
+
+  const normalizedContentType = normalizeContentType(declaredContentType);
+  if (
+    detectedMediaType === QUICKTIME_MAJOR_MEDIA_TYPE &&
+    normalizedContentType === "video/mp4"
+  ) {
+    if (sourceExtensionFromPathname(sourcePathname) !== "mp4") {
+      throw mediaTypeMismatchError();
+    }
+    return {
+      mediaType: MEDIA_TYPES.mp4,
+      contentType: MEDIA_TYPES.mp4.mime,
+    };
+  }
+
+  const mediaType =
+    detectedMediaType === QUICKTIME_MAJOR_MEDIA_TYPE
+      ? MEDIA_TYPES.mov
+      : detectedMediaType;
+  return {
+    mediaType,
+    contentType: validateDeclaredContentType(
+      mediaType,
+      normalizedContentType
+    ),
+  };
+}
+
+export function sourceExtensionFromPathname(value) {
+  const pathname = String(value || "");
+  const filename = pathname.split("/").at(-1) || "";
+  let decoded;
+  try {
+    decoded = decodeURIComponent(filename);
+  } catch {
+    decoded = filename;
+  }
+  if (/[/\\\u0000-\u001f\u007f]/u.test(decoded)) return "";
+  const extension = decoded.split(".").at(-1);
+  if (!extension || extension === decoded) return "";
+  return extension.toLowerCase();
+}
+
+function validateDeclaredContentType(mediaType, normalizedContentType) {
   if (!isKnownMediaType(mediaType)) {
     throw new MediaIngestionError(
       415,
@@ -385,18 +456,13 @@ export function validateMediaContentType(mediaType, declaredContentType) {
     );
   }
 
-  const normalized = normalizeContentType(declaredContentType);
-  if (GENERIC_MIME_TYPES.has(normalized)) return mediaType.mime;
+  if (GENERIC_MIME_TYPES.has(normalizedContentType)) return mediaType.mime;
 
-  const declaredType = MIME_TYPES.get(normalized);
+  const declaredType = MIME_TYPES.get(normalizedContentType);
   if (!declaredType || declaredType.extension !== mediaType.extension) {
-    throw new MediaIngestionError(
-      415,
-      "Source Content-Type does not match its media bytes.",
-      "MEDIA_TYPE_MISMATCH"
-    );
+    throw mediaTypeMismatchError();
   }
-  return normalized;
+  return normalizedContentType;
 }
 
 export function byteLimitForMediaType(mediaType) {
@@ -491,7 +557,7 @@ function detectIsoBaseMediaType(bytes) {
   const boxSize = readUint32(bytes, 0);
   if (boxSize !== 0 && boxSize < 12) return null;
   const majorBrand = ascii(bytes, 8, 4).toLowerCase();
-  if (majorBrand === "qt  ") return MEDIA_TYPES.mov;
+  if (majorBrand === "qt  ") return QUICKTIME_MAJOR_MEDIA_TYPE;
   if (MP4_BRANDS.has(majorBrand)) return MEDIA_TYPES.mp4;
 
   const availableBoxSize =
@@ -505,7 +571,15 @@ function detectIsoBaseMediaType(bytes) {
 }
 
 function isKnownMediaType(mediaType) {
-  return Object.values(MEDIA_TYPES).includes(mediaType);
+  return KNOWN_MEDIA_TYPES.has(mediaType);
+}
+
+function mediaTypeMismatchError() {
+  return new MediaIngestionError(
+    415,
+    "Source Content-Type does not match its media bytes.",
+    "MEDIA_TYPE_MISMATCH"
+  );
 }
 
 function isBlockedIpv4(parts) {

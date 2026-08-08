@@ -13,8 +13,10 @@ import {
   detectMediaType,
   mediaTypeFromContentType,
   parseCanonicalMediaUrl,
+  resolveValidatedMediaType,
   resolveAndValidateRedirectUrl,
   safeSourceUrlMetadata,
+  sourceExtensionFromPathname,
   validateMediaContentType,
   validatePublicHttpsUrl,
 } from "./media-ingestion.js";
@@ -92,7 +94,11 @@ export async function ingestSourceToR2(
 
   const fetchImpl = options.fetchImpl || globalThis.fetch;
   let sourceResponse = legacyR2Key
-    ? await openLegacyR2Source(env.MEDIA_BUCKET, legacyR2Key)
+    ? await openLegacyR2Source(
+        env.MEDIA_BUCKET,
+        legacyR2Key,
+        initialUrl.pathname
+      )
     : await fetchSourceWithRedirects(
         initialUrl,
         fetchImpl,
@@ -123,10 +129,12 @@ export async function ingestSourceToR2(
   if (sourceResponse.legacyR2Key) {
     sourceResponse = await openLegacyR2Source(
       env.MEDIA_BUCKET,
-      sourceResponse.legacyR2Key
+      sourceResponse.legacyR2Key,
+      sourceResponse.sourcePathname
     );
   }
   const { response, controller } = sourceResponse;
+  const sourcePathname = sourceResponse.sourcePathname || initialUrl.pathname;
 
   let uploadId = null;
   let stagingKey = null;
@@ -155,6 +163,7 @@ export async function ingestSourceToR2(
         customMetadata: buildStagingMetadata({
           sourceUrl: source,
           sourceFingerprint: sourceFingerprint(initialUrl.href),
+          sourcePathname,
           uploadId,
           postId,
         }),
@@ -227,11 +236,14 @@ export async function ingestSourceToR2(
       if (!mediaType) {
         mediaType = detectMediaType(prefix.subarray(0, prefixLength));
         if (mediaType) {
-          assertKindMatches(kind, mediaType);
-          storageContentType = validateMediaContentType(
+          const resolved = resolveValidatedMediaType(
             mediaType,
-            declaredContentType
+            declaredContentType,
+            sourcePathname
           );
+          mediaType = resolved.mediaType;
+          assertKindMatches(kind, mediaType);
+          storageContentType = resolved.contentType;
           assertByteLimit(totalBytes, mediaType);
           if (contentLength !== null) assertByteLimit(contentLength, mediaType);
         } else if (prefixLength === prefix.byteLength) {
@@ -242,13 +254,18 @@ export async function ingestSourceToR2(
       await partBuffer.append(chunk, uploadPart);
     }
 
-    mediaType ||= detectMediaType(prefix.subarray(0, prefixLength));
-    if (!mediaType) throw unsupportedMediaError();
+    if (!mediaType) {
+      const detected = detectMediaType(prefix.subarray(0, prefixLength));
+      if (!detected) throw unsupportedMediaError();
+      const resolved = resolveValidatedMediaType(
+        detected,
+        declaredContentType,
+        sourcePathname
+      );
+      mediaType = resolved.mediaType;
+      storageContentType = resolved.contentType;
+    }
     assertKindMatches(kind, mediaType);
-    storageContentType ||= validateMediaContentType(
-      mediaType,
-      declaredContentType
-    );
     assertByteLimit(totalBytes, mediaType);
     if (!totalBytes) throw unsupportedMediaError();
 
@@ -674,6 +691,12 @@ async function inspectStagingObject(bucket, stagingObject, kind) {
   );
   const declaredContentType = staged.httpMetadata?.contentType || "";
   const declaredMediaType = mediaTypeFromContentType(declaredContentType);
+  const stagedSourceExtension =
+    staged.customMetadata?.["source-extension"] ||
+    sourceExtensionFromMetadataUrl(staged.customMetadata?.["source-url"]);
+  const sourcePathname = stagedSourceExtension
+    ? `/source.${stagedSourceExtension}`
+    : "";
   assertKindMatches(kind, declaredMediaType);
   precheckContentLength(staged.size, kind, declaredMediaType);
 
@@ -712,11 +735,14 @@ async function inspectStagingObject(bucket, stagingObject, kind) {
       if (!mediaType) {
         mediaType = detectMediaType(prefix.subarray(0, prefixLength));
         if (mediaType) {
-          assertKindMatches(kind, mediaType);
-          contentType = validateMediaContentType(
+          const resolved = resolveValidatedMediaType(
             mediaType,
-            declaredContentType
+            declaredContentType,
+            sourcePathname
           );
+          mediaType = resolved.mediaType;
+          assertKindMatches(kind, mediaType);
+          contentType = resolved.contentType;
           assertByteLimit(staged.size, mediaType);
         } else if (prefixLength === prefix.byteLength) {
           throw unsupportedMediaError();
@@ -731,7 +757,18 @@ async function inspectStagingObject(bucket, stagingObject, kind) {
     }
   }
 
-  mediaType ||= detectMediaType(prefix.subarray(0, prefixLength));
+  if (!mediaType) {
+    const detected = detectMediaType(prefix.subarray(0, prefixLength));
+    if (detected) {
+      const resolved = resolveValidatedMediaType(
+        detected,
+        declaredContentType,
+        sourcePathname
+      );
+      mediaType = resolved.mediaType;
+      contentType = resolved.contentType;
+    }
+  }
   if (!mediaType || totalBytes !== staged.size) {
     throw new MediaIngestionError(
       503,
@@ -741,7 +778,6 @@ async function inspectStagingObject(bucket, stagingObject, kind) {
     );
   }
   assertKindMatches(kind, mediaType);
-  contentType ||= validateMediaContentType(mediaType, declaredContentType);
   assertByteLimit(totalBytes, mediaType);
 
   return {
@@ -765,7 +801,7 @@ async function deleteStagingObject(bucket, stagingKey) {
   }
 }
 
-async function openLegacyR2Source(bucket, key) {
+async function openLegacyR2Source(bucket, key, sourcePathname) {
   let object;
   try {
     object = await withTimeout(
@@ -816,6 +852,7 @@ async function openLegacyR2Source(bucket, key) {
       body: object.body,
     },
     controller: new AbortController(),
+    sourcePathname,
   };
 }
 
@@ -889,7 +926,12 @@ async function fetchSourceWithRedirects(
       const canonical = parseCanonicalMediaUrl(nextUrl.href, publicBaseUrl);
       if (canonical) return { canonical };
       const legacyR2Key = legacyR2KeyFromUrl(nextUrl, publicBaseUrl);
-      if (legacyR2Key) return { legacyR2Key };
+      if (legacyR2Key) {
+        return {
+          legacyR2Key,
+          sourcePathname: nextUrl.pathname,
+        };
+      }
       currentUrl = nextUrl;
       continue;
     }
@@ -904,7 +946,11 @@ async function fetchSourceWithRedirects(
       );
     }
 
-    return { response, controller };
+    return {
+      response,
+      controller,
+      sourcePathname: currentUrl.pathname,
+    };
   }
 
   throw new MediaIngestionError(
@@ -1423,6 +1469,7 @@ function sourceFingerprint(sourceUrl) {
 function buildStagingMetadata({
   sourceUrl,
   sourceFingerprint: fingerprint,
+  sourcePathname,
   uploadId,
   postId,
 }) {
@@ -1431,9 +1478,19 @@ function buildStagingMetadata({
     "upload-id": uploadId,
   };
   if (postId) metadata["source-post-id"] = postId;
+  const sourceExtension = sourceExtensionFromPathname(sourcePathname);
+  if (sourceExtension) metadata["source-extension"] = sourceExtension;
   const safeSourceUrl = safeSourceUrlMetadata(sourceUrl);
   if (safeSourceUrl) metadata["source-url"] = safeSourceUrl;
   return metadata;
+}
+
+function sourceExtensionFromMetadataUrl(value) {
+  try {
+    return sourceExtensionFromPathname(new URL(value).pathname);
+  } catch {
+    return "";
+  }
 }
 
 function normalizeIngestionError(error) {

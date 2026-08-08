@@ -11,6 +11,7 @@ import {
   deriveCanonicalKey,
   detectMediaType,
   parseCanonicalMediaUrl,
+  resolveValidatedMediaType,
   resolveAndValidateRedirectUrl,
   validateMediaContentType,
   validatePublicHttpsUrl,
@@ -171,6 +172,105 @@ test("detects supported media signatures and enforces MIME agreement", () => {
     (error) => error.details.code === "MEDIA_TYPE_MISMATCH"
   );
   assert.equal(detectMediaType(new TextEncoder().encode("<html>error")), null);
+});
+
+test("normalizes only qt-major video/mp4 sources with an .mp4 path to MP4", () => {
+  const quickTimeMajor = detectMediaType(isoBaseMedia("qt  "));
+
+  const mp4 = resolveValidatedMediaType(
+    quickTimeMajor,
+    "video/mp4",
+    "/videos/assets/legacy.MP4"
+  );
+  assert.deepEqual(
+    {
+      extension: mp4.mediaType.extension,
+      mime: mp4.mediaType.mime,
+      notionFormat: mp4.mediaType.notionFormat,
+      contentType: mp4.contentType,
+    },
+    {
+      extension: "mp4",
+      mime: "video/mp4",
+      notionFormat: "MP4",
+      contentType: "video/mp4",
+    }
+  );
+
+  const mov = resolveValidatedMediaType(
+    quickTimeMajor,
+    "video/quicktime",
+    "/videos/assets/legacy.mov"
+  );
+  assert.deepEqual(
+    {
+      extension: mov.mediaType.extension,
+      mime: mov.mediaType.mime,
+      notionFormat: mov.mediaType.notionFormat,
+      contentType: mov.contentType,
+    },
+    {
+      extension: "mov",
+      mime: "video/quicktime",
+      notionFormat: null,
+      contentType: "video/quicktime",
+    }
+  );
+
+  assert.throws(
+    () =>
+      resolveValidatedMediaType(
+        quickTimeMajor,
+        "video/mp4",
+        "/videos/assets/legacy.mov"
+      ),
+    (error) => error.details.code === "MEDIA_TYPE_MISMATCH"
+  );
+  assert.throws(
+    () =>
+      resolveValidatedMediaType(
+        quickTimeMajor,
+        "video/mp4",
+        "/videos/assets/legacy.mp4/"
+      ),
+    (error) => error.details.code === "MEDIA_TYPE_MISMATCH"
+  );
+  assert.throws(
+    () =>
+      resolveValidatedMediaType(
+        quickTimeMajor,
+        "video/mp4",
+        "/videos/assets/legacy.mp4%2Fhidden"
+      ),
+    (error) => error.details.code === "MEDIA_TYPE_MISMATCH"
+  );
+  assert.throws(
+    () =>
+      resolveValidatedMediaType(
+        detectMediaType(Uint8Array.from([0xff, 0xd8, 0xff])),
+        "video/mp4",
+        "/videos/assets/not-really.mp4"
+      ),
+    (error) => error.details.code === "MEDIA_TYPE_MISMATCH"
+  );
+  assert.equal(
+    detectMediaType(new TextEncoder().encode("not an ISO container")),
+    null
+  );
+});
+
+test("accepts representative 543 MB qt-major legacy MP4 metadata without buffering", () => {
+  const resolved = resolveValidatedMediaType(
+    detectMediaType(isoBaseMedia("qt  ")),
+    "video/mp4",
+    "/videos/assets/a0/a0bfddc7-d9f2-4d0a-aaf0-980e8d6be87d.mp4"
+  );
+
+  assert.equal(resolved.mediaType.extension, "mp4");
+  assert.equal(resolved.contentType, "video/mp4");
+  assert.doesNotThrow(() =>
+    assertByteLimit(543_569_879, resolved.mediaType)
+  );
 });
 
 test("derives content-addressed keys and enforces media byte limits", () => {
