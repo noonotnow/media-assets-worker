@@ -1,7 +1,11 @@
 # Media Assets Worker
 
-Phase 1 Cloudflare Worker for creating rows in Katie's Notion Media Assets database.
-R2 upload and restoration are intentionally deferred to Phase 2.
+Phase 1.5 Cloudflare Worker for creating rows in Katie's Notion Media Assets
+database, including manual Post → Media Asset mapping.
+
+R2 upload, R2 restoration, scheduled Post scans, and file fallback are
+intentionally deferred. The scheduled scan will be added after manual mapping
+has been proven against real Post rows.
 
 ## IDs
 
@@ -58,8 +62,56 @@ curl -X POST https://YOUR-WORKER.workers.dev/media-assets \
   }'
 ```
 
+Inspect the source fields used for mapping a Post:
+
+```bash
+curl https://YOUR-WORKER.workers.dev/post/NOTION_POST_PAGE_UUID \
+  -H "Authorization: Bearer YOUR_WORKER_API_KEY"
+```
+
+Create or find the Media Asset mapped from a Post:
+
+```bash
+curl -X POST https://YOUR-WORKER.workers.dev/from-post \
+  -H "Authorization: Bearer YOUR_WORKER_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"postId":"NOTION_POST_PAGE_UUID"}'
+```
+
+The response includes `created: true` for a new row or `created: false` when
+deduplication finds an existing row.
+
+## Post qualification and mapping
+
+A Post qualifies only when the first usable image field contains a complete,
+valid `http://` or `https://` URL. Image aliases are checked first
+(`Images URL`, `Image URL`, `Images`), followed by thumbnail aliases
+(`Thumbnail`, `Thumbnail URL`). Image URL wins over thumbnail. File-type Notion
+properties are supported only for external HTTP(S) URLs; temporary
+Notion-hosted file URLs do not qualify. R2 identifiers, relative paths,
+malformed URLs, and other protocols do not qualify.
+
+The selected URL becomes `Cloudflare URL`; its URL pathname becomes
+`Cloudflare Path` when available. The mapper reads Headline/title, Platform,
+Series, Production Mode, Media source, Campaign / event name, Campaign notes /
+requirements, Requirements, Notes, and Needs media. It writes only destination
+properties whose types are confirmed by the live Media Assets data-source
+schema. Select/status values are written only when the option already exists;
+other source context is retained in Media Asset Notes.
+
+If Media Assets has a `Source Post` relation property, it is populated and used
+for deduplication. Otherwise, deduplication falls back to exact
+`Cloudflare URL` equality when that URL property exists. The Media Assets schema
+is cached briefly by each Worker isolate.
+
+All endpoints except `GET /health` require
+`Authorization: Bearer YOUR_WORKER_API_KEY`.
+
 ## Notion requirement
 
 Share both databases with the Notion integration under Notion → database menu → Connections.
 
 If Notion returns `object_not_found`, the integration probably does not have access or the database ID is wrong.
+
+`POSTS_DATABASE_ID` is retained as configuration metadata but is not used as a
+data-source ID. Post lookup uses `GET /v1/pages/{postId}` directly.
