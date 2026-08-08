@@ -1,4 +1,4 @@
-const NOTION_VERSION = "2022-06-28";
+const NOTION_VERSION = "2025-09-03";
 
 const DEFAULT_MEDIA_ASSET_PROPS = {
   assetType: "Image",
@@ -62,8 +62,9 @@ function assertConfig(env) {
   const missing = [];
   if (!env.NOTION_TOKEN) missing.push("NOTION_TOKEN");
   if (!env.WORKER_API_KEY) missing.push("WORKER_API_KEY");
-  if (!env.MEDIA_ASSETS_DATABASE_ID) missing.push("MEDIA_ASSETS_DATABASE_ID");
-  if (!env.POSTS_DATABASE_ID) missing.push("POSTS_DATABASE_ID");
+  if (!env.MEDIA_ASSETS_DATA_SOURCE_ID) {
+    missing.push("MEDIA_ASSETS_DATA_SOURCE_ID");
+  }
 
   if (missing.length) {
     const error = new Error(`Missing required environment variables: ${missing.join(", ")}`);
@@ -159,7 +160,10 @@ function buildMediaAssetPayload(env, input) {
   }
 
   return {
-    parent: { database_id: env.MEDIA_ASSETS_DATABASE_ID },
+    parent: {
+      type: "data_source_id",
+      data_source_id: env.MEDIA_ASSETS_DATA_SOURCE_ID,
+    },
     properties,
   };
 }

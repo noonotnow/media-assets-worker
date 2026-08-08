@@ -6,7 +6,8 @@ R2 upload and restoration are intentionally deferred to Phase 2.
 ## IDs
 
 ```txt
-MEDIA_ASSETS_DATABASE_ID=3b08d902-271f-815c-8d9e-fbd9a8989100
+MEDIA_ASSETS_DATABASE_ID=7c86b4f3-1f36-4f82-96d8-1fe87962fcc0
+MEDIA_ASSETS_DATA_SOURCE_ID=97d14043-3d6b-46db-959b-d8a8d55feee3
 POSTS_DATABASE_ID=3a78d902-271f-80fa-b91d-000b638f5907
 ```
 
