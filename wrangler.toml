@@ -1,0 +1,12 @@
+name = "media-assets-worker"
+main = "src/index.js"
+compatibility_date = "2026-08-08"
+
+[vars]
+MEDIA_ASSETS_DATABASE_ID = "3b08d902-271f-815c-8d9e-fbd9a8989100"
+POSTS_DATABASE_ID = "3a78d902-271f-80fa-b91d-000b638f5907"
+
+# Add after you create/confirm the R2 bucket:
+# [[r2_buckets]]
+# binding = "MEDIA_BUCKET"
+# bucket_name = "your-bucket-name"
