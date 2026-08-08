@@ -5,6 +5,7 @@ import test from "node:test";
 import { CANONICAL_R2_ORIGIN, IMAGE_MAX_BYTES } from "../src/media-ingestion.js";
 import {
   ingestSourceToR2,
+  legacyR2KeyFromUrl,
   stagingPrefixForSource,
 } from "../src/r2-ingestion.js";
 import { MemoryR2Bucket } from "./helpers/memory-r2.js";
@@ -12,6 +13,10 @@ import { MemoryR2Bucket } from "./helpers/memory-r2.js";
 const PNG_BYTES = Uint8Array.from([
   0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4,
 ]);
+const JPEG_BYTES = Uint8Array.from([
+  0xff, 0xd8, 0xff, 0xdb, 0x00, 0x43, 0x01,
+]);
+const MP4_BYTES = isoBaseMedia("isom");
 
 test("streams a small image through multipart staging and cleans staging", async () => {
   const bucket = new MemoryR2Bucket();
@@ -160,6 +165,166 @@ test("preserves staging when an existing canonical object lacks exact SHA metada
   }
 });
 
+test("rejects malformed canonical namespaces and internal import staging keys", async () => {
+  const bucket = new MemoryR2Bucket();
+  const sources = [
+    [
+      `${CANONICAL_R2_ORIGIN}/images/sha256/aa/bb/not-a-hash.jpg`,
+      "INVALID_CANONICAL_URL",
+    ],
+    [
+      `${CANONICAL_R2_ORIGIN}/videos/sha256/aa/bb/${"aa".repeat(32)}.jpg`,
+      "INVALID_CANONICAL_URL",
+    ],
+    [
+      `${CANONICAL_R2_ORIGIN}/imports/staging/private-upload`,
+      "INTERNAL_R2_SOURCE_FORBIDDEN",
+    ],
+    [
+      `${CANONICAL_R2_ORIGIN}/videos/sha256/../../uploads/safe.mp4`,
+      "INVALID_CANONICAL_URL",
+    ],
+    [
+      `${CANONICAL_R2_ORIGIN}/imports/staging/%2e%2e/%2e%2e/uploads/safe.mp4`,
+      "INTERNAL_R2_SOURCE_FORBIDDEN",
+    ],
+  ];
+
+  for (const [sourceUrl, expectedCode] of sources) {
+    await assert.rejects(
+      ingestSourceToR2(
+        testEnv(bucket),
+        { sourceUrl },
+        {
+          fetchImpl: async () => {
+            throw new Error("same-origin rejected paths must not fetch");
+          },
+        }
+      ),
+      (error) => error.status === 400 && error.details.code === expectedCode
+    );
+  }
+  assert.equal(bucket.multipartUploads.length, 0);
+});
+
+test("rejects a redirect that normalizes out of a forbidden custom-origin path", async () => {
+  const bucket = new MemoryR2Bucket();
+  bucket.seed("uploads/safe.png", PNG_BYTES, {
+    httpMetadata: { contentType: "image/png" },
+  });
+
+  await assert.rejects(
+    ingestSourceToR2(
+      testEnv(bucket),
+      { sourceUrl: "https://source.example.com/traversal-redirect" },
+      {
+        fetchImpl: async () =>
+          new Response(null, {
+            status: 302,
+            headers: {
+              Location: `${CANONICAL_R2_ORIGIN}/imports/staging/../../uploads/safe.png`,
+            },
+          }),
+      }
+    ),
+    (error) =>
+      error.status === 400 &&
+      error.details.code === "INTERNAL_R2_SOURCE_FORBIDDEN"
+  );
+  assert.equal(bucket.multipartUploads.length, 0);
+});
+
+test("ingests a legacy same-origin video asset through the bound bucket", async () => {
+  const bucket = new MemoryR2Bucket();
+  const legacyKey = "videos/assets/123e4567-e89b-12d3-a456-426614174000.mp4";
+  bucket.seed(legacyKey, MP4_BYTES, {
+    httpMetadata: { contentType: "video/mp4" },
+  });
+
+  const result = await ingestSourceToR2(
+    testEnv(bucket),
+    { sourceUrl: `${CANONICAL_R2_ORIGIN}/${legacyKey}` },
+    {
+      fetchImpl: async () => {
+        throw new Error("bound R2 legacy source must not use outbound fetch");
+      },
+    }
+  );
+
+  assert.equal(result.mediaKind, "video");
+  assert.equal(result.extension, "mp4");
+  assert.match(result.key, /^videos\/sha256\/[0-9a-f]{2}\/[0-9a-f]{2}\//);
+  assert.equal((await bucket.head(legacyKey)).size, MP4_BYTES.byteLength);
+  assert.equal(bucket.deletedKeys.includes(legacyKey), false);
+  assert.deepEqual(bucket.stagingKeys(), []);
+});
+
+test("ingests a legacy same-origin image path without mutating its source", async () => {
+  const bucket = new MemoryR2Bucket();
+  const legacyKey = "images/assets/day-4-cover.jpeg";
+  bucket.seed(legacyKey, JPEG_BYTES, {
+    httpMetadata: { contentType: "image/jpeg" },
+  });
+
+  const result = await ingestSourceToR2(
+    testEnv(bucket),
+    { sourceUrl: `${CANONICAL_R2_ORIGIN}/${legacyKey}` },
+    {
+      fetchImpl: async () => {
+        throw new Error("bound R2 legacy source must not use outbound fetch");
+      },
+    }
+  );
+
+  assert.equal(result.mediaKind, "image");
+  assert.equal(result.extension, "jpg");
+  assert.match(result.key, /^images\/sha256\/[0-9a-f]{2}\/[0-9a-f]{2}\//);
+  assert.equal((await bucket.head(legacyKey)).size, JPEG_BYTES.byteLength);
+  assert.equal(bucket.deletedKeys.includes(legacyKey), false);
+  assert.deepEqual(bucket.stagingKeys(), []);
+});
+
+test("returns not found for an absent legacy same-origin R2 source", async () => {
+  const bucket = new MemoryR2Bucket();
+  await assert.rejects(
+    ingestSourceToR2(
+      testEnv(bucket),
+      {
+        sourceUrl: `${CANONICAL_R2_ORIGIN}/uploads/missing-image.jpg`,
+      },
+      {
+        fetchImpl: async () => {
+          throw new Error("absent bound source must not use outbound fetch");
+        },
+      }
+    ),
+    (error) =>
+      error.status === 404 &&
+      error.details.code === "LEGACY_R2_SOURCE_MISSING"
+  );
+  assert.equal(bucket.multipartUploads.length, 0);
+});
+
+test("validates decoded legacy R2 keys while allowing legacy staging namespaces", () => {
+  assert.equal(
+    legacyR2KeyFromUrl(
+      `${CANONICAL_R2_ORIGIN}/videos/staging/completed-object.mp4`
+    ),
+    "videos/staging/completed-object.mp4"
+  );
+  assert.equal(
+    legacyR2KeyFromUrl(`${CANONICAL_R2_ORIGIN}/uploads/day%204/photo.jpg`),
+    "uploads/day 4/photo.jpg"
+  );
+  assert.throws(
+    () =>
+      legacyR2KeyFromUrl(
+        `${CANONICAL_R2_ORIGIN}/uploads/unsafe%5Ckey.jpg`
+      ),
+    (error) => error.details.code === "INVALID_LEGACY_R2_KEY"
+  );
+});
+
 test("handles a redirect to canonical media with R2 HEAD instead of download", async () => {
   const bucket = new MemoryR2Bucket();
   const hash = createHash("sha256").update(PNG_BYTES).digest("hex");
@@ -191,6 +356,34 @@ test("handles a redirect to canonical media with R2 HEAD instead of download", a
   assert.equal(result.r2Action, "reused");
   assert.equal(result.url, `${CANONICAL_R2_ORIGIN}/${key}`);
   assert.equal(bucket.multipartUploads.length, 0);
+});
+
+test("switches a legacy custom-origin redirect to the bound R2 source", async () => {
+  const bucket = new MemoryR2Bucket();
+  const legacyKey = "videos/assets/redirected-legacy.mp4";
+  bucket.seed(legacyKey, MP4_BYTES, {
+    httpMetadata: { contentType: "video/mp4" },
+  });
+  let fetches = 0;
+
+  const result = await ingestSourceToR2(
+    testEnv(bucket),
+    { sourceUrl: "https://source.example.com/legacy-redirect" },
+    {
+      fetchImpl: async () => {
+        fetches += 1;
+        return new Response(null, {
+          status: 302,
+          headers: { Location: `${CANONICAL_R2_ORIGIN}/${legacyKey}` },
+        });
+      },
+    }
+  );
+
+  assert.equal(fetches, 1);
+  assert.equal(result.mediaKind, "video");
+  assert.equal((await bucket.head(legacyKey)).size, MP4_BYTES.byteLength);
+  assert.equal(bucket.deletedKeys.includes(legacyKey), false);
 });
 
 test("rejects canonical-looking URLs when the R2 object is absent", async () => {
@@ -576,4 +769,13 @@ function sourceResponse(bytes, contentType, contentLength = bytes.byteLength) {
       "Content-Length": String(contentLength),
     },
   });
+}
+
+function isoBaseMedia(brand) {
+  const bytes = new Uint8Array(24);
+  bytes.set([0, 0, 0, 24], 0);
+  bytes.set(new TextEncoder().encode("ftyp"), 4);
+  bytes.set(new TextEncoder().encode(brand), 8);
+  bytes.set(new TextEncoder().encode(brand), 16);
+  return bytes;
 }

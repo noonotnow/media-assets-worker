@@ -78,15 +78,12 @@ test("revalidates relative and absolute redirects", () => {
     () => resolveAndValidateRedirectUrl("http://example.com/plain", current),
     (error) => error.details.code === "UNSAFE_SOURCE_REDIRECT"
   );
-  assert.throws(
-    () =>
-      resolveAndValidateRedirectUrl(
-        `${CANONICAL_R2_ORIGIN}/videos/staging/unfinished`,
-        current
-      ),
-    (error) =>
-      error.details.code === "UNSAFE_SOURCE_REDIRECT" &&
-      error.details.reason === "INVALID_CANONICAL_URL"
+  assert.equal(
+    resolveAndValidateRedirectUrl(
+      `${CANONICAL_R2_ORIGIN}/videos/staging/completed.mp4`,
+      current
+    ).href,
+    `${CANONICAL_R2_ORIGIN}/videos/staging/completed.mp4`
   );
 });
 

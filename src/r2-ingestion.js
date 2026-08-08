@@ -41,7 +41,16 @@ export async function ingestSourceToR2(
   assertKind(kind);
 
   const source = typeof sourceUrl === "string" ? sourceUrl.trim() : "";
-  const canonical = parseCanonicalMediaUrl(source, env.R2_PUBLIC_BASE_URL);
+  const initialUrl = validatePublicHttpsUrl(source);
+  assertSafeRawCustomOriginReference(
+    source,
+    initialUrl,
+    env.R2_PUBLIC_BASE_URL
+  );
+  const canonical = parseCanonicalMediaUrl(
+    initialUrl.href,
+    env.R2_PUBLIC_BASE_URL
+  );
   if (canonical) {
     const object = await headCanonicalObject(env.MEDIA_BUCKET, canonical);
     if (!object) {
@@ -62,15 +71,10 @@ export async function ingestSourceToR2(
     });
   }
 
-  if (hasCanonicalOrigin(source)) {
-    throw new MediaIngestionError(
-      400,
-      "URL on the canonical media origin does not use a valid canonical key.",
-      "INVALID_CANONICAL_URL"
-    );
-  }
-
-  const initialUrl = validatePublicHttpsUrl(source);
+  const legacyR2Key = legacyR2KeyFromUrl(
+    initialUrl,
+    env.R2_PUBLIC_BASE_URL
+  );
   const stagingPrefix = stagingPrefixForSource(initialUrl.href);
   const preservedStaging = await findPreservedStaging(
     env.MEDIA_BUCKET,
@@ -87,11 +91,13 @@ export async function ingestSourceToR2(
   }
 
   const fetchImpl = options.fetchImpl || globalThis.fetch;
-  const sourceResponse = await fetchSourceWithRedirects(
-    initialUrl,
-    fetchImpl,
-    env.R2_PUBLIC_BASE_URL
-  );
+  let sourceResponse = legacyR2Key
+    ? await openLegacyR2Source(env.MEDIA_BUCKET, legacyR2Key)
+    : await fetchSourceWithRedirects(
+        initialUrl,
+        fetchImpl,
+        env.R2_PUBLIC_BASE_URL
+      );
   if (sourceResponse.canonical) {
     const object = await headCanonicalObject(
       env.MEDIA_BUCKET,
@@ -113,6 +119,12 @@ export async function ingestSourceToR2(
       contentType: metadata.contentType,
       action: "reused",
     });
+  }
+  if (sourceResponse.legacyR2Key) {
+    sourceResponse = await openLegacyR2Source(
+      env.MEDIA_BUCKET,
+      sourceResponse.legacyR2Key
+    );
   }
   const { response, controller } = sourceResponse;
 
@@ -386,6 +398,147 @@ export function stagingPrefixForSource(sourceUrl) {
   return `imports/staging/src-${sourceFingerprint(sourceUrl)}-`;
 }
 
+export function legacyR2KeyFromUrl(
+  value,
+  publicBaseUrl = CANONICAL_R2_ORIGIN
+) {
+  const rawValue = value instanceof URL ? null : String(value || "");
+  const url = value instanceof URL ? value : validatePublicHttpsUrl(rawValue);
+  if (rawValue !== null) {
+    assertSafeRawCustomOriginReference(rawValue, url, publicBaseUrl);
+  }
+  let base;
+  try {
+    base = new URL(publicBaseUrl);
+  } catch {
+    return null;
+  }
+  if (url.origin !== base.origin) return null;
+
+  const encodedKey = url.pathname.slice(1);
+  if (!encodedKey) {
+    throw new MediaIngestionError(
+      400,
+      "Custom-origin source URL must identify an R2 object.",
+      "INVALID_LEGACY_R2_KEY"
+    );
+  }
+
+  let key;
+  try {
+    key = decodeURIComponent(encodedKey);
+  } catch {
+    throw new MediaIngestionError(
+      400,
+      "Custom-origin source URL contains an invalid encoded R2 key.",
+      "INVALID_LEGACY_R2_KEY"
+    );
+  }
+
+  const segments = key.split("/");
+  const unsafe =
+    key !== key.trim() ||
+    new TextEncoder().encode(key).byteLength > 1024 ||
+    /[\u0000-\u001f\u007f\\]/u.test(key) ||
+    segments.some((segment) => !segment || segment === "." || segment === "..");
+  if (unsafe) {
+    throw new MediaIngestionError(
+      400,
+      "Custom-origin source URL contains an unsafe R2 key.",
+      "INVALID_LEGACY_R2_KEY"
+    );
+  }
+
+  const lowerKey = key.toLowerCase();
+  if (/^(images|videos)\/sha256(?:\/|$)/u.test(lowerKey)) {
+    throw new MediaIngestionError(
+      400,
+      "Canonical SHA path is malformed.",
+      "INVALID_CANONICAL_URL"
+    );
+  }
+  if (/^imports\/staging(?:\/|$)/u.test(lowerKey)) {
+    throw new MediaIngestionError(
+      400,
+      "Internal import staging objects cannot be used as public sources.",
+      "INTERNAL_R2_SOURCE_FORBIDDEN"
+    );
+  }
+
+  return key;
+}
+
+function assertSafeRawCustomOriginReference(
+  reference,
+  resolvedUrl,
+  publicBaseUrl
+) {
+  let base;
+  try {
+    base = new URL(publicBaseUrl);
+  } catch {
+    return;
+  }
+  if (resolvedUrl.origin !== base.origin) return;
+
+  const raw = String(reference || "");
+  const rawPath = rawPathFromUrlReference(raw);
+  let decodedPath;
+  try {
+    decodedPath = decodeURIComponent(rawPath);
+  } catch {
+    throw rawCustomPathError(rawPath);
+  }
+
+  const segments = decodedPath.split("/");
+  const traversal =
+    raw.includes("\\") ||
+    decodedPath.includes("\\") ||
+    segments.some((segment) => segment === "." || segment === "..");
+  if (traversal) throw rawCustomPathError(decodedPath);
+}
+
+function rawPathFromUrlReference(reference) {
+  const withoutFragment = reference.split("#", 1)[0];
+  const queryIndex = withoutFragment.indexOf("?");
+  const withoutQuery =
+    queryIndex === -1
+      ? withoutFragment
+      : withoutFragment.slice(0, queryIndex);
+  const absoluteMatch = withoutQuery.match(
+    /^[a-z][a-z0-9+.-]*:\/\/[^/]*(\/.*)?$/iu
+  );
+  if (absoluteMatch) return absoluteMatch[1] || "/";
+  const schemeRelativeMatch = withoutQuery.match(/^\/\/[^/]*(\/.*)?$/u);
+  if (schemeRelativeMatch) return schemeRelativeMatch[1] || "/";
+  return withoutQuery;
+}
+
+function rawCustomPathError(path) {
+  const key = String(path || "")
+    .replace(/^\/+/u, "")
+    .toLowerCase();
+  if (/^(images|videos)\/sha256(?:\/|$)/u.test(key)) {
+    return new MediaIngestionError(
+      400,
+      "Canonical SHA path contains unsafe traversal or encoding.",
+      "INVALID_CANONICAL_URL"
+    );
+  }
+  if (/^imports\/staging(?:\/|$)/u.test(key)) {
+    return new MediaIngestionError(
+      400,
+      "Internal import staging path is not a valid public source.",
+      "INTERNAL_R2_SOURCE_FORBIDDEN"
+    );
+  }
+  return new MediaIngestionError(
+    400,
+    "Custom-origin source path contains unsafe traversal or encoding.",
+    "INVALID_LEGACY_R2_KEY"
+  );
+}
+
 export function isR2Configured(env) {
   if (!hasR2Binding(env)) {
     return false;
@@ -612,6 +765,60 @@ async function deleteStagingObject(bucket, stagingKey) {
   }
 }
 
+async function openLegacyR2Source(bucket, key) {
+  let object;
+  try {
+    object = await withTimeout(
+      bucket.get(key),
+      SOURCE_CONNECT_TIMEOUT_MS,
+      () => undefined,
+      new MediaIngestionError(
+        504,
+        "Bound R2 source response timed out.",
+        "R2_SOURCE_CONNECT_TIMEOUT"
+      )
+    );
+  } catch (error) {
+    if (error instanceof MediaIngestionError) throw error;
+    throw new MediaIngestionError(
+      502,
+      "Bound R2 source request failed.",
+      "R2_SOURCE_READ_FAILED"
+    );
+  }
+  if (!object?.body) {
+    throw new MediaIngestionError(
+      404,
+      "Legacy R2 source object does not exist.",
+      "LEGACY_R2_SOURCE_MISSING"
+    );
+  }
+  if (!Number.isSafeInteger(object.size) || object.size < 0) {
+    throw new MediaIngestionError(
+      502,
+      "Legacy R2 source object has invalid size metadata.",
+      "R2_SOURCE_SIZE_INVALID"
+    );
+  }
+
+  const headers = new Headers({
+    "Content-Length": String(object.size),
+  });
+  if (object.httpMetadata?.contentType) {
+    headers.set("Content-Type", object.httpMetadata.contentType);
+  }
+
+  return {
+    response: {
+      status: 200,
+      ok: true,
+      headers,
+      body: object.body,
+    },
+    controller: new AbortController(),
+  };
+}
+
 async function fetchSourceWithRedirects(
   initialUrl,
   fetchImpl,
@@ -660,10 +867,16 @@ async function fetchSourceWithRedirects(
         );
       }
       let nextUrl;
+      const location = response.headers.get("Location");
       try {
         nextUrl = resolveAndValidateRedirectUrl(
-          response.headers.get("Location"),
+          location,
           currentUrl
+        );
+        assertSafeRawCustomOriginReference(
+          location,
+          nextUrl,
+          publicBaseUrl
         );
       } finally {
         try {
@@ -675,6 +888,8 @@ async function fetchSourceWithRedirects(
       }
       const canonical = parseCanonicalMediaUrl(nextUrl.href, publicBaseUrl);
       if (canonical) return { canonical };
+      const legacyR2Key = legacyR2KeyFromUrl(nextUrl, publicBaseUrl);
+      if (legacyR2Key) return { legacyR2Key };
       currentUrl = nextUrl;
       continue;
     }
@@ -1193,14 +1408,6 @@ function tooLargeError(kind) {
     "SOURCE_TOO_LARGE",
     { limitBytes: limit }
   );
-}
-
-function hasCanonicalOrigin(value) {
-  try {
-    return new URL(value).origin === CANONICAL_R2_ORIGIN;
-  } catch {
-    return false;
-  }
 }
 
 function bytesToHex(bytes) {
