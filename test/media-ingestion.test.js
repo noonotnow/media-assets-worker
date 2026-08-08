@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   CANONICAL_R2_ORIGIN,
   IMAGE_MAX_BYTES,
+  MAX_ISO_FTYP_BOX_BYTES,
   VIDEO_MAX_BYTES,
   MediaIngestionError,
   assertByteLimit,
@@ -11,6 +12,7 @@ import {
   deriveCanonicalKey,
   detectMediaType,
   parseCanonicalMediaUrl,
+  resolveValidatedMediaType,
   resolveAndValidateRedirectUrl,
   validateMediaContentType,
   validatePublicHttpsUrl,
@@ -173,6 +175,188 @@ test("detects supported media signatures and enforces MIME agreement", () => {
   assert.equal(detectMediaType(new TextEncoder().encode("<html>error")), null);
 });
 
+test("normalizes only qt-major video/mp4 sources with an .mp4 path to MP4", () => {
+  const quickTimeMajor = detectMediaType(isoBaseMedia("qt  "));
+
+  const mp4 = resolveValidatedMediaType(
+    quickTimeMajor,
+    "video/mp4",
+    "/videos/assets/legacy.MP4"
+  );
+  assert.deepEqual(
+    {
+      extension: mp4.mediaType.extension,
+      mime: mp4.mediaType.mime,
+      notionFormat: mp4.mediaType.notionFormat,
+      contentType: mp4.contentType,
+    },
+    {
+      extension: "mp4",
+      mime: "video/mp4",
+      notionFormat: "MP4",
+      contentType: "video/mp4",
+    }
+  );
+
+  const mov = resolveValidatedMediaType(
+    quickTimeMajor,
+    "video/quicktime",
+    "/videos/assets/legacy.mov"
+  );
+  assert.deepEqual(
+    {
+      extension: mov.mediaType.extension,
+      mime: mov.mediaType.mime,
+      notionFormat: mov.mediaType.notionFormat,
+      contentType: mov.contentType,
+    },
+    {
+      extension: "mov",
+      mime: "video/quicktime",
+      notionFormat: null,
+      contentType: "video/quicktime",
+    }
+  );
+
+  assert.throws(
+    () =>
+      resolveValidatedMediaType(
+        quickTimeMajor,
+        "video/mp4",
+        "/videos/assets/legacy.mov"
+      ),
+    (error) => error.details.code === "MEDIA_TYPE_MISMATCH"
+  );
+  assert.throws(
+    () =>
+      resolveValidatedMediaType(
+        quickTimeMajor,
+        "video/mp4",
+        "/videos/assets/legacy.mp4/"
+      ),
+    (error) => error.details.code === "MEDIA_TYPE_MISMATCH"
+  );
+  assert.throws(
+    () =>
+      resolveValidatedMediaType(
+        quickTimeMajor,
+        "video/mp4",
+        "/videos/assets/legacy.mp4%2Fhidden"
+      ),
+    (error) => error.details.code === "MEDIA_TYPE_MISMATCH"
+  );
+  assert.throws(
+    () =>
+      resolveValidatedMediaType(
+        detectMediaType(Uint8Array.from([0xff, 0xd8, 0xff])),
+        "video/mp4",
+        "/videos/assets/not-really.mp4"
+      ),
+    (error) => error.details.code === "MEDIA_TYPE_MISMATCH"
+  );
+  assert.equal(
+    detectMediaType(new TextEncoder().encode("not an ISO container")),
+    null
+  );
+});
+
+test("accepts representative 543 MB qt-major legacy MP4 metadata without buffering", () => {
+  const resolved = resolveValidatedMediaType(
+    detectMediaType(isoBaseMedia("qt  ")),
+    "video/mp4",
+    "/videos/assets/a0/a0bfddc7-d9f2-4d0a-aaf0-980e8d6be87d.mp4"
+  );
+
+  assert.equal(resolved.mediaType.extension, "mp4");
+  assert.equal(resolved.contentType, "video/mp4");
+  assert.doesNotThrow(() =>
+    assertByteLimit(543_569_879, resolved.mediaType)
+  );
+});
+
+test("requires a complete bounded and aligned ftyp box before ISO detection", () => {
+  const truncated = isoFtypBox({
+    majorBrand: "qt  ",
+    declaredSize: 24,
+    actualSize: 12,
+  });
+  assert.equal(detectMediaType(truncated), null);
+
+  const minimum = isoFtypBox({
+    majorBrand: "qt  ",
+    declaredSize: 16,
+    actualSize: 16,
+  });
+  const normalized = resolveValidatedMediaType(
+    detectMediaType(minimum),
+    "video/mp4",
+    "/videos/assets/minimum.mp4"
+  );
+  assert.equal(normalized.mediaType.extension, "mp4");
+
+  const compatibleInside = isoFtypBox({
+    majorBrand: "zzzz",
+    compatibleBrands: ["qt  "],
+  });
+  assert.equal(detectMediaType(compatibleInside).extension, "mov");
+
+  const compatibleOutside = isoFtypBox({
+    majorBrand: "zzzz",
+    compatibleBrands: ["qt  "],
+    declaredSize: 16,
+    actualSize: 20,
+  });
+  assert.equal(detectMediaType(compatibleOutside), null);
+
+  const absurd = isoFtypBox({
+    majorBrand: "qt  ",
+    declaredSize: MAX_ISO_FTYP_BOX_BYTES + 4,
+    actualSize: 16,
+  });
+  assert.equal(detectMediaType(absurd), null);
+  assert.equal(
+    detectMediaType(
+      isoFtypBox({
+        majorBrand: "qt  ",
+        declaredSize: 18,
+        actualSize: 18,
+      })
+    ),
+    null
+  );
+  assert.equal(
+    detectMediaType(
+      isoFtypBox({
+        majorBrand: "qt  ",
+        declaredSize: 1,
+        actualSize: 24,
+      })
+    ),
+    null
+  );
+  assert.equal(
+    detectMediaType(
+      isoFtypBox({
+        majorBrand: "qt  ",
+        declaredSize: 0,
+        actualSize: 24,
+      })
+    ),
+    null
+  );
+
+  const capCut = Uint8Array.from(
+    Buffer.from("0000001466747970717420200000000071742020", "hex")
+  );
+  const capCutType = resolveValidatedMediaType(
+    detectMediaType(capCut),
+    "video/mp4",
+    "/videos/assets/capcut.mp4"
+  );
+  assert.equal(capCutType.mediaType.extension, "mp4");
+  assert.equal(detectMediaType(new TextEncoder().encode("not ISO-BMFF")), null);
+});
+
 test("derives content-addressed keys and enforces media byte limits", () => {
   const hash = "0123456789abcdef".repeat(4);
   const png = detectMediaType(
@@ -226,5 +410,36 @@ function isoBaseMedia(brand) {
   bytes.set(new TextEncoder().encode("ftyp"), 4);
   bytes.set(new TextEncoder().encode(brand), 8);
   bytes.set(new TextEncoder().encode(brand), 16);
+  return bytes;
+}
+
+function isoFtypBox({
+  majorBrand,
+  compatibleBrands = [],
+  declaredSize = 16 + compatibleBrands.length * 4,
+  actualSize = declaredSize,
+}) {
+  const bytes = new Uint8Array(actualSize);
+  if (actualSize >= 4) {
+    bytes.set(
+      [
+        (declaredSize >>> 24) & 0xff,
+        (declaredSize >>> 16) & 0xff,
+        (declaredSize >>> 8) & 0xff,
+        declaredSize & 0xff,
+      ],
+      0
+    );
+  }
+  if (actualSize >= 8) bytes.set(new TextEncoder().encode("ftyp"), 4);
+  if (actualSize >= 12) {
+    bytes.set(new TextEncoder().encode(majorBrand), 8);
+  }
+  for (let index = 0; index < compatibleBrands.length; index += 1) {
+    const offset = 16 + index * 4;
+    if (offset + 4 <= actualSize) {
+      bytes.set(new TextEncoder().encode(compatibleBrands[index]), offset);
+    }
+  }
   return bytes;
 }

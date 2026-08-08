@@ -17,6 +17,7 @@ const JPEG_BYTES = Uint8Array.from([
   0xff, 0xd8, 0xff, 0xdb, 0x00, 0x43, 0x01,
 ]);
 const MP4_BYTES = isoBaseMedia("isom");
+const QUICKTIME_MAJOR_BYTES = isoBaseMedia("qt  ");
 
 test("streams a small image through multipart staging and cleans staging", async () => {
   const bucket = new MemoryR2Bucket();
@@ -257,6 +258,198 @@ test("ingests a legacy same-origin video asset through the bound bucket", async 
   assert.equal((await bucket.head(legacyKey)).size, MP4_BYTES.byteLength);
   assert.equal(bucket.deletedKeys.includes(legacyKey), false);
   assert.deepEqual(bucket.stagingKeys(), []);
+});
+
+test("normalizes a qt-major legacy .mp4 object with video/mp4 metadata to MP4", async () => {
+  const bucket = new MemoryR2Bucket();
+  const legacyKey =
+    "videos/assets/a0/a0bfddc7-d9f2-4d0a-aaf0-980e8d6be87d.mp4";
+  bucket.seed(legacyKey, QUICKTIME_MAJOR_BYTES, {
+    httpMetadata: { contentType: "video/mp4" },
+  });
+
+  const result = await ingestSourceToR2(
+    testEnv(bucket),
+    { sourceUrl: `${CANONICAL_R2_ORIGIN}/${legacyKey}` },
+    {
+      fetchImpl: async () => {
+        throw new Error("bound R2 source must not use outbound fetch");
+      },
+    }
+  );
+
+  assert.equal(result.extension, "mp4");
+  assert.equal(result.contentType, "video/mp4");
+  assert.equal(result.format, "MP4");
+  assert.match(result.key, /^videos\/sha256\/[0-9a-f]{2}\/[0-9a-f]{2}\/.*\.mp4$/);
+  assert.equal(
+    (await bucket.head(legacyKey)).size,
+    QUICKTIME_MAJOR_BYTES.byteLength
+  );
+  assert.equal(bucket.deletedKeys.includes(legacyKey), false);
+});
+
+test("keeps qt-major video/quicktime .mov sources as MOV", async () => {
+  const bucket = new MemoryR2Bucket();
+  const legacyKey = "videos/assets/legacy-quicktime.mov";
+  bucket.seed(legacyKey, QUICKTIME_MAJOR_BYTES, {
+    httpMetadata: { contentType: "video/quicktime" },
+  });
+
+  const result = await ingestSourceToR2(
+    testEnv(bucket),
+    { sourceUrl: `${CANONICAL_R2_ORIGIN}/${legacyKey}` }
+  );
+
+  assert.equal(result.extension, "mov");
+  assert.equal(result.contentType, "video/quicktime");
+  assert.equal(result.format, null);
+  assert.match(result.key, /\.mov$/);
+});
+
+test("rejects qt-major video/mp4 metadata on a .mov source path", async () => {
+  const bucket = new MemoryR2Bucket();
+  const legacyKey = "videos/assets/mislabeled.mov";
+  bucket.seed(legacyKey, QUICKTIME_MAJOR_BYTES, {
+    httpMetadata: { contentType: "video/mp4" },
+  });
+
+  await assert.rejects(
+    ingestSourceToR2(
+      testEnv(bucket),
+      { sourceUrl: `${CANONICAL_R2_ORIGIN}/${legacyKey}` }
+    ),
+    (error) =>
+      error.status === 415 &&
+      error.details.code === "MEDIA_TYPE_MISMATCH"
+  );
+  assert.equal(bucket.deletedKeys.includes(legacyKey), false);
+});
+
+test("does not double-decode a legacy R2 key into an .mp4 extension", async () => {
+  const bucket = new MemoryR2Bucket();
+  const legacyKey = "videos/assets/not-dot%2Emp4";
+  bucket.seed(legacyKey, QUICKTIME_MAJOR_BYTES, {
+    httpMetadata: { contentType: "video/mp4" },
+  });
+
+  await assert.rejects(
+    ingestSourceToR2(
+      testEnv(bucket),
+      {
+        sourceUrl: `${CANONICAL_R2_ORIGIN}/videos/assets/not-dot%252Emp4`,
+      }
+    ),
+    (error) =>
+      error.status === 415 &&
+      error.details.code === "MEDIA_TYPE_MISMATCH"
+  );
+  assert.equal(bucket.deletedKeys.includes(legacyKey), false);
+});
+
+test("applies qt-major .mp4 compatibility to external HTTPS sources", async () => {
+  const result = await ingestSourceToR2(
+    testEnv(new MemoryR2Bucket()),
+    { sourceUrl: "https://assets.example.com/external-quicktime.mp4" },
+    {
+      fetchImpl: async () =>
+        sourceResponse(QUICKTIME_MAJOR_BYTES, "video/mp4"),
+    }
+  );
+
+  assert.equal(result.extension, "mp4");
+  assert.equal(result.contentType, "video/mp4");
+  assert.equal(result.format, "MP4");
+});
+
+test("waits for the complete declared ftyp box across source chunks", async () => {
+  const first = QUICKTIME_MAJOR_BYTES.subarray(0, 12);
+  const second = QUICKTIME_MAJOR_BYTES.subarray(12);
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(first);
+      controller.enqueue(second);
+      controller.close();
+    },
+  });
+
+  const result = await ingestSourceToR2(
+    testEnv(new MemoryR2Bucket()),
+    { sourceUrl: "https://assets.example.com/fragmented-quicktime.mp4" },
+    {
+      fetchImpl: async () =>
+        new Response(stream, {
+          status: 200,
+          headers: {
+            "Content-Type": "video/mp4",
+            "Content-Length": String(QUICKTIME_MAJOR_BYTES.byteLength),
+          },
+        }),
+    }
+  );
+
+  assert.equal(result.extension, "mp4");
+  assert.equal(result.contentType, "video/mp4");
+});
+
+test("rejects a truncated source that declares a larger ftyp box", async () => {
+  const truncated = QUICKTIME_MAJOR_BYTES.subarray(0, 12);
+  await assert.rejects(
+    ingestSourceToR2(
+      testEnv(new MemoryR2Bucket()),
+      { sourceUrl: "https://assets.example.com/truncated-quicktime.mp4" },
+      {
+        fetchImpl: async () => sourceResponse(truncated, "video/mp4"),
+      }
+    ),
+    (error) =>
+      error.status === 415 &&
+      error.details.code === "UNSUPPORTED_MEDIA_SIGNATURE"
+  );
+});
+
+test("preserves qt-major MP4 normalization when promotion resumes from staging", async () => {
+  const bucket = new MemoryR2Bucket();
+  const hash = createHash("sha256")
+    .update(QUICKTIME_MAJOR_BYTES)
+    .digest("hex");
+  const key = `videos/sha256/${hash.slice(0, 2)}/${hash.slice(
+    2,
+    4
+  )}/${hash}.mp4`;
+  bucket.failMultipartForKey = key;
+  bucket.failUploadPartAt = 1;
+  const sourceUrl = "https://assets.example.com/retry-quicktime.mp4";
+
+  await assert.rejects(
+    ingestSourceToR2(
+      testEnv(bucket),
+      { sourceUrl },
+      {
+        fetchImpl: async () =>
+          sourceResponse(QUICKTIME_MAJOR_BYTES, "video/mp4"),
+      }
+    ),
+    (error) =>
+      error.details.code === "R2_CANONICAL_PROMOTION_RETRYABLE"
+  );
+
+  bucket.failMultipartForKey = null;
+  bucket.failUploadPartAt = null;
+  const result = await ingestSourceToR2(
+    testEnv(bucket),
+    { sourceUrl },
+    {
+      fetchImpl: async () => {
+        throw new Error("retry should use staged bytes");
+      },
+    }
+  );
+
+  assert.equal(result.stagingResumed, true);
+  assert.equal(result.extension, "mp4");
+  assert.equal(result.contentType, "video/mp4");
+  assert.equal(result.format, "MP4");
 });
 
 test("ingests a legacy same-origin image path without mutating its source", async () => {

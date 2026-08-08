@@ -71,6 +71,21 @@ option:
 | QuickTime | `.mov` | omitted |
 | WebM | `.webm` | omitted |
 
+One narrow compatibility exception handles existing MP4 assets whose ISO-BMFF
+major brand is `qt  `: they normalize to MP4 only when source metadata is
+exactly `video/mp4` and the final sanitized source pathname ends in `.mp4`
+(case-insensitive). `video/quicktime` remains MOV behavior, and a `video/mp4`
+declaration on a `.mov` path is rejected. The signature is still mandatory;
+extensions never make arbitrary bytes valid media. The source extension is
+stored with retry staging so resumed promotion makes the same decision.
+
+ISO-BMFF detection recognizes brands only after the complete declared `ftyp`
+box is present in the bounded sniff buffer. Normal boxes must be at least 16
+bytes, no larger than 1 KiB, and aligned to complete 4-byte compatible-brand
+entries. Truncated, zero-size, extended-size, unaligned, and oversized `ftyp`
+declarations are rejected; compatible brands outside the declared box are
+ignored.
+
 Canonical writes use:
 
 ```txt
