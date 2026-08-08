@@ -7,7 +7,6 @@ import worker, {
   buildExistingMediaAssetFilter,
   buildFromPostMediaAssetPayload,
   buildPostAssets,
-  convergeSourcePostRelation,
   extractStableAssetUrls,
   qualifyPostFields,
   simplifyPostPage,
@@ -16,6 +15,7 @@ import { CANONICAL_R2_ORIGIN } from "../src/media-ingestion.js";
 import { MemoryR2Bucket } from "./helpers/memory-r2.js";
 
 const POST_ID = "3068d902-271f-810e-82e8-f878238d58dd";
+const SECOND_POST_ID = "4068d902-271f-810e-82e8-f878238d58aa";
 
 test("extracts newline image URLs in source order and infers image and video metadata", () => {
   const post = simplifyPostPage({
@@ -274,7 +274,7 @@ test("builds schema-compatible properties for each asset", () => {
   );
 });
 
-test("dedupe filter always includes exact URL and optionally Source Post", () => {
+test("dedupe filter requires Source Post and exact canonical URL", () => {
   const withRelation = buildExistingMediaAssetFilter(
     destinationSchema(),
     POST_ID,
@@ -307,10 +307,7 @@ test("dedupe filter always includes exact URL and optionally Source Post", () =>
       },
     ],
   });
-  assert.deepEqual(withoutRelation, {
-    property: "Cloudflare URL",
-    url: { equals: "https://assets.example.com/a.png" },
-  });
+  assert.equal(withoutRelation, null);
   assert.equal(withoutUrl, null);
 });
 
@@ -338,72 +335,6 @@ test("legacy row updates include only managed canonical fields", () => {
     select: { name: "Rednote post" },
   });
 
-});
-
-test("relation convergence retries with the union after a concurrent overwrite", async () => {
-  let relationIds = ["base-post"];
-  let patches = 0;
-  const page = () => ({
-    id: "canonical-row",
-    url: "https://www.notion.so/canonical-row",
-    properties: {
-      "Source Post": {
-        relation: relationIds.map((id) => ({ id })),
-        has_more: false,
-      },
-    },
-  });
-
-  const result = await convergeSourcePostRelation({
-    postId: POST_ID,
-    relationName: "Source Post",
-    readPage: async () => page(),
-    patchPage: async (desired) => {
-      patches += 1;
-      relationIds =
-        patches === 1
-          ? [POST_ID, "concurrent-post"]
-          : desired;
-      return page();
-    },
-  });
-
-  assert.equal(result.attempts, 2);
-  assert.equal(patches, 2);
-  assert.deepEqual(relationIds, [
-    "base-post",
-    POST_ID,
-    "concurrent-post",
-  ]);
-});
-
-test("relation convergence refuses to overflow the readable relation snapshot", async () => {
-  const relationIds = Array.from(
-    { length: 25 },
-    (_, index) => `post-${index + 1}`
-  );
-  let patches = 0;
-
-  await assert.rejects(
-    convergeSourcePostRelation({
-      postId: POST_ID,
-      relationName: "Source Post",
-      readPage: async () => ({
-        id: "full-row",
-        properties: {
-          "Source Post": {
-            relation: relationIds.map((id) => ({ id })),
-            has_more: false,
-          },
-        },
-      }),
-      patchPage: async () => {
-        patches += 1;
-      },
-    }),
-    (error) => error.status === 409 && /safe inline limit/.test(error.message)
-  );
-  assert.equal(patches, 0);
 });
 
 test("POST /from-post ingests to R2, updates a legacy row, and reuses canonical rows", async () => {
@@ -815,6 +746,128 @@ test("POST /from-post reconciles every legacy row that collapses to one canonica
       "Keep B"
     );
     assert.equal(body.duplicates[0].reason, "duplicate-content");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("identical bytes create separate Post-scoped rows over one canonical R2 object", async () => {
+  const originalFetch = globalThis.fetch;
+  const bucket = new MemoryR2Bucket();
+  const bytes = Uint8Array.from([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 9,
+  ]);
+  const canonicalUrl = canonicalUrlForBytes(bytes, "images", "png");
+  const rows = [];
+
+  globalThis.fetch = async (url, init = {}) => {
+    const parsedUrl = new URL(url);
+    const path = parsedUrl.pathname;
+    if (parsedUrl.hostname === "assets.example.com") {
+      return mediaResponse(bytes, "image/png");
+    }
+    const sourcePostId = [POST_ID, SECOND_POST_ID].find(
+      (postId) => path === `/v1/pages/${postId}`
+    );
+    if (sourcePostId) {
+      return notionResponse({
+        id: sourcePostId,
+        url: `https://www.notion.so/${sourcePostId}`,
+        properties: {
+          Headline: {
+            type: "title",
+            title: [{ plain_text: `Post ${sourcePostId.slice(0, 4)}` }],
+          },
+          "Image URL": {
+            type: "url",
+            url: "https://assets.example.com/shared.png",
+          },
+        },
+      });
+    }
+    if (path === "/v1/data_sources/post-scoped-source") {
+      return notionResponse({ properties: destinationSchema() });
+    }
+    if (path.endsWith("/query")) {
+      const body = JSON.parse(init.body);
+      const postId = body.filter.and[0].relation.contains;
+      const assetUrl = body.filter.and[1].url.equals;
+      return notionResponse({
+        results: rows.filter(
+          (page) =>
+            page.properties["Cloudflare URL"].url === assetUrl &&
+            page.properties["Source Post"].relation.some(
+              (relation) => relation.id === postId
+            )
+        ),
+        has_more: false,
+      });
+    }
+    if (path === "/v1/pages" && init.method === "POST") {
+      const body = JSON.parse(init.body);
+      const page = {
+        id: `post-scoped-row-${rows.length + 1}`,
+        url: `https://www.notion.so/post-scoped-row-${rows.length + 1}`,
+        properties: body.properties,
+      };
+      rows.push(page);
+      return notionResponse(page);
+    }
+    if (init.method === "PATCH") {
+      throw new Error("Cross-Post canonical rows must never be mutated.");
+    }
+    throw new Error(`Unexpected request: ${init.method || "GET"} ${url}`);
+  };
+
+  const env = {
+    NOTION_TOKEN: "test-token",
+    WORKER_API_KEY: "test-key",
+    MEDIA_ASSETS_DATA_SOURCE_ID: "post-scoped-source",
+    MEDIA_BUCKET: bucket,
+    R2_PUBLIC_BASE_URL: CANONICAL_R2_ORIGIN,
+  };
+  const ingestPost = async (postId) => {
+    const response = await worker.fetch(
+      new Request("https://worker.example/from-post", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer test-key",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ postId }),
+      }),
+      env
+    );
+    return { response, body: await response.json() };
+  };
+
+  try {
+    const first = await ingestPost(POST_ID);
+    const second = await ingestPost(SECOND_POST_ID);
+    const repeat = await ingestPost(POST_ID);
+
+    assert.equal(first.response.status, 200, JSON.stringify(first.body));
+    assert.equal(second.response.status, 200, JSON.stringify(second.body));
+    assert.equal(repeat.response.status, 200, JSON.stringify(repeat.body));
+    assert.equal(first.body.results[0].notionAction, "created");
+    assert.equal(second.body.results[0].notionAction, "created");
+    assert.equal(repeat.body.results[0].notionAction, "existing");
+    assert.equal(first.body.results[0].url, canonicalUrl);
+    assert.equal(second.body.results[0].url, canonicalUrl);
+    assert.equal(rows.length, 2);
+    assert.deepEqual(
+      rows.map((page) =>
+        page.properties["Source Post"].relation.map((relation) => relation.id)
+      ),
+      [[POST_ID], [SECOND_POST_ID]]
+    );
+    assert.notEqual(rows[0].id, rows[1].id);
+    assert.deepEqual(
+      [...bucket.objects.keys()].filter(
+        (key) => !key.startsWith("imports/staging/")
+      ),
+      [canonicalUrl.slice(`${CANONICAL_R2_ORIGIN}/`.length)]
+    );
   } finally {
     globalThis.fetch = originalFetch;
   }

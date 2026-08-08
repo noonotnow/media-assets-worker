@@ -63,7 +63,7 @@ test("streams a small image through multipart staging and cleans staging", async
   assert.equal(bucket.multipartUploads[0].aborted, false);
 });
 
-test("reuses an existing canonical URL only after an R2 HEAD", async () => {
+test("reuses an existing canonical URL only with matching SHA metadata", async () => {
   const bucket = new MemoryR2Bucket();
   const hash = createHash("sha256").update(PNG_BYTES).digest("hex");
   const key = `images/sha256/${hash.slice(0, 2)}/${hash.slice(
@@ -89,6 +89,75 @@ test("reuses an existing canonical URL only after an R2 HEAD", async () => {
   assert.equal(result.size, PNG_BYTES.byteLength);
   assert.equal(bucket.multipartUploads.length, 0);
   assert.deepEqual(bucket.putKeys, []);
+});
+
+test("rejects canonical URLs with missing or mismatched SHA metadata", async () => {
+  const hash = createHash("sha256").update(PNG_BYTES).digest("hex");
+  const key = `images/sha256/${hash.slice(0, 2)}/${hash.slice(
+    2,
+    4
+  )}/${hash}.png`;
+
+  for (const [label, customMetadata, expectedCode] of [
+    ["missing", {}, "R2_CANONICAL_HASH_MISSING"],
+    [
+      "mismatched",
+      { sha256: "ab".repeat(32) },
+      "R2_CANONICAL_HASH_CONFLICT",
+    ],
+  ]) {
+    const bucket = new MemoryR2Bucket();
+    bucket.seed(key, PNG_BYTES, {
+      httpMetadata: { contentType: "image/png" },
+      customMetadata,
+    });
+    await assert.rejects(
+      ingestSourceToR2(testEnv(bucket), {
+        sourceUrl: `${CANONICAL_R2_ORIGIN}/${key}`,
+      }),
+      (error) =>
+        error.status === 409 &&
+        error.details.code === expectedCode,
+      label
+    );
+  }
+});
+
+test("preserves staging when an existing canonical object lacks exact SHA metadata", async () => {
+  const hash = createHash("sha256").update(PNG_BYTES).digest("hex");
+  const key = `images/sha256/${hash.slice(0, 2)}/${hash.slice(
+    2,
+    4
+  )}/${hash}.png`;
+
+  for (const [label, customMetadata, expectedDuring] of [
+    ["missing", {}, "R2_CANONICAL_HASH_MISSING"],
+    [
+      "mismatched",
+      { sha256: "cd".repeat(32) },
+      "R2_CANONICAL_HASH_CONFLICT",
+    ],
+  ]) {
+    const bucket = new MemoryR2Bucket();
+    bucket.seed(key, PNG_BYTES, {
+      httpMetadata: { contentType: "image/png" },
+      customMetadata,
+    });
+
+    await assert.rejects(
+      ingestSourceToR2(
+        testEnv(bucket),
+        { sourceUrl: `https://assets.example.com/${label}-hash.png` },
+        { fetchImpl: async () => sourceResponse(PNG_BYTES, "image/png") }
+      ),
+      (error) =>
+        error.status === 409 &&
+        error.details.code === "R2_CANONICAL_VERIFY_CONFLICT" &&
+        error.details.during === expectedDuring &&
+        error.details.stagingKey.startsWith("imports/staging/src-")
+    );
+    assert.equal(bucket.stagingKeys().length, 1);
+  }
 });
 
 test("handles a redirect to canonical media with R2 HEAD instead of download", async () => {

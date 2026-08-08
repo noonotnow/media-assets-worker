@@ -14,8 +14,6 @@ import {
 const NOTION_VERSION = "2025-09-03";
 const SCHEMA_CACHE_TTL_MS = 5 * 60 * 1000;
 const MAX_NOTION_QUERY_PAGES = 10;
-const SOURCE_POST_RELATION_ATTEMPTS = 3;
-const MAX_INLINE_NOTION_RELATIONS = 25;
 
 const DEFAULT_MEDIA_ASSET_PROPS = {
   assetType: "Image",
@@ -75,7 +73,6 @@ const DESTINATION_FIELD_ALIASES = Object.freeze({
 });
 
 const mediaAssetsSchemaCache = new Map();
-const sourcePostRelationLocks = new Map();
 
 export default {
   async fetch(request, env) {
@@ -262,6 +259,18 @@ async function createMediaAssetFromPost(env, postId) {
       "Media Assets schema must expose a URL property named Cloudflare URL for idempotent Post imports."
     );
   }
+  if (
+    !findSchemaProperty(
+      destinationProperties,
+      DESTINATION_FIELD_ALIASES.sourcePost,
+      "relation"
+    )
+  ) {
+    throw httpError(
+      500,
+      "Media Assets schema must expose a Source Post relation for Post-scoped catalog identity."
+    );
+  }
   const results = [];
   let created = 0;
   let updated = 0;
@@ -272,10 +281,11 @@ async function createMediaAssetFromPost(env, postId) {
       record.sourceAsset,
       record.ingestion
     );
-    const canonicalRows = await findExistingMediaAssetsByUrl(
+    const canonicalRows = await findExistingMediaAssets(
       env,
       schema,
-      asset.url
+      simplifiedPost,
+      asset
     );
     const canonicalIds = new Set(canonicalRows.map((page) => page.id));
     const legacyRowsById = new Map();
@@ -295,34 +305,22 @@ async function createMediaAssetFromPost(env, postId) {
     const notionRows = [];
 
     for (const legacyRow of legacyRows) {
-      const migrated = await updateLegacyMediaAsset(
+      const page = await updateLegacyMediaAsset(
         env,
         destinationProperties,
         legacyRow,
         asset
       );
-      const linked = await ensureSourcePostRelation(
-        env,
-        destinationProperties,
-        migrated,
-        simplifiedPost.id
-      );
       updated += 1;
       notionRows.push(
-        summarizeReconciledRow(linked.page, "updated", linked.updated)
+        summarizeReconciledRow(page, "updated")
       );
     }
 
     for (const canonicalRow of [...canonicalRows].sort(comparePageIds)) {
-      const linked = await ensureSourcePostRelation(
-        env,
-        destinationProperties,
-        canonicalRow,
-        simplifiedPost.id
-      );
       existing += 1;
       notionRows.push(
-        summarizeReconciledRow(linked.page, "existing", linked.updated)
+        summarizeReconciledRow(canonicalRow, "existing")
       );
     }
 
@@ -338,7 +336,7 @@ async function createMediaAssetFromPost(env, postId) {
         body: JSON.stringify(payload),
       });
       created += 1;
-      notionRows.push(summarizeReconciledRow(page, "created", false));
+      notionRows.push(summarizeReconciledRow(page, "created"));
     }
 
     const primary = notionRows[0];
@@ -356,7 +354,6 @@ async function createMediaAssetFromPost(env, postId) {
       notionActions,
       notionRows,
       reconciledRowIds: notionRows.map((row) => row.id),
-      sourcePostLinked: notionRows.some((row) => row.sourcePostLinked),
       created: notionRows.some((row) => row.action === "created"),
       updated: notionRows.some((row) => row.action === "updated"),
       existing: notionRows.some((row) => row.action === "existing"),
@@ -403,15 +400,6 @@ async function findExistingMediaAssets(env, schema, post, asset) {
     properties,
     post.id,
     asset.url
-  );
-  if (!filter) return [];
-  return queryMediaAssetRows(env, filter);
-}
-
-async function findExistingMediaAssetsByUrl(env, schema, cloudflareUrl) {
-  const filter = buildCanonicalMediaAssetFilter(
-    schema.properties || {},
-    cloudflareUrl
   );
   if (!filter) return [];
   return queryMediaAssetRows(env, filter);
@@ -464,130 +452,11 @@ async function updateLegacyMediaAsset(
   });
 }
 
-async function ensureSourcePostRelation(
-  env,
-  destinationSchema,
-  page,
-  postId
-) {
-  const sourcePost = findSchemaProperty(
-    destinationSchema,
-    DESTINATION_FIELD_ALIASES.sourcePost,
-    "relation"
-  );
-  if (!sourcePost) return { page, updated: false };
-
-  return withSourcePostRelationLock(page.id, () =>
-    convergeSourcePostRelation({
-      postId,
-      relationName: sourcePost.name,
-      readPage: () => notionFetch(env, `/v1/pages/${page.id}`),
-      patchPage: (relationIds) =>
-        notionFetch(env, `/v1/pages/${page.id}`, {
-          method: "PATCH",
-          body: JSON.stringify({
-            properties: {
-              [sourcePost.name]: {
-                relation: relationIds.map((id) => ({ id })),
-              },
-            },
-          }),
-        }),
-    })
-  );
-}
-
-export function mergeRelationIds(currentIds, requiredIds) {
-  const merged = new Set();
-  for (const id of [...currentIds, ...requiredIds]) {
-    if (typeof id === "string" && id) merged.add(id);
-  }
-  return [...merged];
-}
-
-export async function convergeSourcePostRelation({
-  postId,
-  relationName,
-  readPage,
-  patchPage,
-  maxAttempts = SOURCE_POST_RELATION_ATTEMPTS,
-}) {
-  let updated = false;
-  let requiredIds = [];
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    const currentPage = await readPage();
-    const current = relationIdsFromPage(currentPage, relationName);
-    requiredIds = mergeRelationIds(requiredIds, current);
-    requiredIds = mergeRelationIds(requiredIds, [postId]);
-    if (requiredIds.every((id) => current.includes(id))) {
-      return { page: currentPage, updated, attempts: attempt };
-    }
-
-    const desired = requiredIds;
-    if (desired.length > MAX_INLINE_NOTION_RELATIONS) {
-      throw httpError(
-        409,
-        "Source Post relation is at the safe inline limit and was not modified."
-      );
-    }
-    await patchPage(desired);
-    updated = true;
-
-    const verifiedPage = await readPage();
-    const verified = relationIdsFromPage(verifiedPage, relationName);
-    requiredIds = mergeRelationIds(requiredIds, verified);
-    if (requiredIds.every((id) => verified.includes(id))) {
-      return { page: verifiedPage, updated, attempts: attempt };
-    }
-  }
-
-  throw httpError(
-    409,
-    "Source Post relation changed concurrently and could not be converged safely."
-  );
-}
-
-async function withSourcePostRelationLock(pageId, operation) {
-  const previous = sourcePostRelationLocks.get(pageId) || Promise.resolve();
-  const current = previous.catch(() => undefined).then(operation);
-  sourcePostRelationLocks.set(pageId, current);
-
-  try {
-    return await current;
-  } finally {
-    if (sourcePostRelationLocks.get(pageId) === current) {
-      sourcePostRelationLocks.delete(pageId);
-    }
-  }
-}
-
-function relationIdsFromPage(page, relationName) {
-  const property = page.properties?.[relationName];
-  if (!property || !Array.isArray(property.relation)) {
-    throw httpError(
-      502,
-      `Notion page did not return the ${relationName} relation.`
-    );
-  }
-  if (property.has_more) {
-    throw httpError(
-      409,
-      "Existing Media Asset has too many Source Post relations to update safely."
-    );
-  }
-  return mergeRelationIds(
-    property.relation.map((relation) => relation.id),
-    []
-  );
-}
-
-function summarizeReconciledRow(page, action, sourcePostLinked) {
+function summarizeReconciledRow(page, action) {
   return {
     id: page.id,
     rowUrl: page.url,
     action,
-    sourcePostLinked,
   };
 }
 
@@ -646,7 +515,7 @@ export function buildExistingMediaAssetFilter(
     "relation"
   );
 
-  if (!sourcePost) return urlFilter;
+  if (!sourcePost || !postId) return null;
 
   return {
     and: [
@@ -656,22 +525,6 @@ export function buildExistingMediaAssetFilter(
       },
       urlFilter,
     ],
-  };
-}
-
-export function buildCanonicalMediaAssetFilter(
-  destinationSchema,
-  cloudflareUrl
-) {
-  const urlProperty = findSchemaProperty(
-    destinationSchema,
-    DESTINATION_FIELD_ALIASES.cloudflareUrl,
-    "url"
-  );
-  if (!urlProperty || !cloudflareUrl) return null;
-  return {
-    property: urlProperty.name,
-    url: { equals: cloudflareUrl },
   };
 }
 

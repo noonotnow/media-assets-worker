@@ -77,6 +77,11 @@ Custom metadata includes SHA-256 and upload ID, plus Source Post ID when
 available. Source URL metadata omits the query string and is included only
 when the result fits the conservative metadata size cap.
 
+Canonical reuse requires all three checks: object size matches, stored
+Content-Type is compatible with the canonical extension, and
+`customMetadata.sha256` exists and exactly matches the SHA-256 in the key.
+Missing hash metadata is not verified.
+
 ## Configuration
 
 `wrangler.toml` uses the native binding. Do not add R2 access keys:
@@ -200,14 +205,15 @@ The Post source aliases remain:
 
 Rich text may contain newline-, whitespace-, or comma-separated URLs. A unique
 thumbnail becomes Asset Type `Cover` with Canonical Label `Thumbnail`. Other
-detected images/videos become one row per canonical object. Different source
-URLs with identical bytes collapse to one canonical row/result and appear in
-the response `duplicates` array with reason `duplicate-content`.
+detected images/videos become one row per Post and canonical object. Within one
+Post, different source URLs with identical bytes collapse to one canonical
+row/result and appear in the response `duplicates` array with reason
+`duplicate-content`.
 
 After R2 success:
 
-- Query exact canonical Cloudflare URL first.
-- Return every exact canonical Cloudflare URL row, not only the first.
+- Query exact canonical Cloudflare URL together with the current Source Post.
+  A canonical row linked only to another Post is never reused or mutated.
 - Query Source Post + every original source URL that collapsed to the canonical
   object. Every matching legacy row is updated in Cloudflare URL, Cloudflare
   Path, Filename, supported Format, Asset Type, Storage Status, Asset Status,
@@ -218,19 +224,17 @@ Human notes and unrelated metadata are not replaced during legacy migration.
 `Uploaded to Cloudflare` is written only after successful R2 validation and
 only when the destination option already exists.
 
-Source Post relation updates are serialized per Media Asset page within one
-Worker isolate. Each update re-fetches the page, writes the union, and
-re-fetches to verify it, retrying a bounded number of times if a concurrent
-write is observed. Notion exposes no ETag/conditional relation update, so
-cross-isolate convergence remains best effort; an observed failure to preserve
-the union returns an error instead of silently dropping relations. Because a
-page response exposes at most 25 inline relation entries, adding a 26th Source
-Post is rejected before mutation rather than writing an unverifiable array.
+R2 deduplication is global by canonical content hash. Notion catalog identity
+is deliberately narrower: `(Source Post, canonical Cloudflare URL)`. Two Posts
+with identical bytes share one R2 object but retain separate Media Assets rows,
+each linked only to its own Post. This removes cross-Post relation-array
+mutation and its lost-update race.
 
 Notion dedupe remains a best-effort query-then-create operation. Concurrent
-requests can still create duplicate Notion rows; Durable Object serialization
-is intentionally deferred for this phase. R2 writes are content-addressed, so
-concurrent writes for an identical hash/key contain identical bytes.
+requests for the same Post and canonical URL can still create duplicate Notion
+rows; Durable Object serialization is intentionally deferred for this phase.
+R2 writes are content-addressed, so concurrent writes for an identical hash/key
+contain identical bytes.
 
 ## Endpoints
 
@@ -291,9 +295,9 @@ curl -X POST "$WORKER_URL/from-post" \
 
 Each unique result includes `sourceUrl`, canonical `url`, `cloudflarePath`,
 `r2Action`, `stagingResumed`, and `notionRows`. Every Notion row reports its
-`id`, action (`created`, `updated`, or `existing`), and whether its Source Post
-relation changed. `reconciledRowIds` exposes all rows that converged to the
-canonical object; top-level `notionAction` is `reconciled` when actions differ.
+`id` and action (`created`, `updated`, or `existing`). `reconciledRowIds`
+exposes all rows for the current Post that converged to the canonical object;
+top-level `notionAction` is `reconciled` when actions differ.
 Aggregate counts include source assets, canonical assets,
 created/updated/existing rows, deduplicated content, and skipped sources.
 
@@ -322,6 +326,10 @@ curl -X POST "$WORKER_URL/media-assets" \
 - Canonical promotion uses an independently abortable multipart upload and is
   verified with `HEAD`; staging is deleted only after compatible canonical
   hash, size, and type verification.
+- If a canonical key exists with missing or mismatched SHA metadata, the
+  request returns `R2_CANONICAL_VERIFY_CONFLICT` with a safe staging key and
+  recovery hint. Completed staging remains intact; the unverified canonical
+  object must be repaired or removed deliberately.
 - Cleanup deletes only the exact staging object that was verified. Concurrent
   retry staging for the same source fingerprint is left for its own request to
   reconcile.

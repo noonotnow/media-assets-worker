@@ -264,9 +264,12 @@ export async function ingestSourceToR2(
 
     let action;
     if (existing) {
-      validateCanonicalHead(canonicalTarget, existing, {
-        expectedSize: totalBytes,
-      });
+      validateCanonicalForPromotion(
+        canonicalTarget,
+        existing,
+        totalBytes,
+        stagingKey
+      );
       action = "reused";
     } else {
       action = await promoteStagingObject(env.MEDIA_BUCKET, {
@@ -475,9 +478,12 @@ async function resumeStagedPromotion(
   );
   let action;
   if (existing) {
-    validateCanonicalHead(canonical, existing, {
-      expectedSize: inspected.size,
-    });
+    validateCanonicalForPromotion(
+      canonical,
+      existing,
+      inspected.size,
+      stagingObject.key
+    );
     action = "reused";
   } else {
     action = await promoteStagingObject(env.MEDIA_BUCKET, {
@@ -830,7 +836,7 @@ async function promoteStagingObject(
         "R2_CANONICAL_VERIFY_RETRYABLE"
       );
     }
-    validateCanonicalHead(canonical, promoted, { expectedSize: size });
+    validateCanonicalForPromotion(canonical, promoted, size, stagingKey);
     return "uploaded";
   } catch (error) {
     promotionError = error;
@@ -846,20 +852,12 @@ async function promoteStagingObject(
       // A transient HEAD failure is returned as a retryable promotion error.
     }
     if (racedObject) {
-      try {
-        validateCanonicalHead(canonical, racedObject, { expectedSize: size });
-      } catch (validationError) {
-        throw new MediaIngestionError(
-          409,
-          "Canonical R2 verification conflicted with completed staging.",
-          "R2_CANONICAL_VERIFY_CONFLICT",
-          {
-            retryable: false,
-            stagingKey,
-            during: validationError?.details?.code || null,
-          }
-        );
-      }
+      validateCanonicalForPromotion(
+        canonical,
+        racedObject,
+        size,
+        stagingKey
+      );
       return destinationCompleted ? "uploaded" : "reused";
     }
     throw new MediaIngestionError(
@@ -1058,7 +1056,14 @@ function validateCanonicalHead(canonical, object, options = {}) {
     storedContentType
   );
   const storedHash = object.customMetadata?.sha256;
-  if (storedHash && storedHash !== canonical.sha256) {
+  if (!storedHash) {
+    throw new MediaIngestionError(
+      409,
+      "Canonical R2 object is missing required SHA-256 metadata.",
+      "R2_CANONICAL_HASH_MISSING"
+    );
+  }
+  if (storedHash !== canonical.sha256) {
     throw new MediaIngestionError(
       409,
       "Canonical R2 object has conflicting hash metadata.",
@@ -1067,6 +1072,29 @@ function validateCanonicalHead(canonical, object, options = {}) {
   }
 
   return { size, contentType };
+}
+
+function validateCanonicalForPromotion(
+  canonical,
+  object,
+  expectedSize,
+  stagingKey
+) {
+  try {
+    return validateCanonicalHead(canonical, object, { expectedSize });
+  } catch (error) {
+    throw new MediaIngestionError(
+      409,
+      "Canonical R2 metadata conflicts with completed staging; staging was preserved for recovery.",
+      "R2_CANONICAL_VERIFY_CONFLICT",
+      {
+        retryable: false,
+        stagingKey,
+        recovery: "repair-or-remove-canonical-object",
+        during: error?.details?.code || null,
+      }
+    );
+  }
 }
 
 function buildIngestionResult({
