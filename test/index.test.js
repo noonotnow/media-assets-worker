@@ -7,7 +7,7 @@ import {
   simplifyPostPage,
 } from "../src/index.js";
 
-const POST_ID = "3a78d902-271f-80fa-b91d-000b638f5907";
+const POST_ID = "11111111-2222-4333-8444-555555555555";
 
 test("simplifies Post aliases and prefers the image URL", () => {
   const post = simplifyPostPage({

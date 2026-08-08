@@ -12,7 +12,8 @@ has been proven against real Post rows.
 ```txt
 MEDIA_ASSETS_DATABASE_ID=7c86b4f3-1f36-4f82-96d8-1fe87962fcc0
 MEDIA_ASSETS_DATA_SOURCE_ID=97d14043-3d6b-46db-959b-d8a8d55feee3
-POSTS_DATABASE_ID=3a78d902-271f-80fa-b91d-000b638f5907
+POSTS_DATABASE_ID=3068d902-271f-810e-82e8-f878238d58dd
+POSTS_DATA_SOURCE_ID=3068d902-271f-8111-89ac-000bbaa74214
 ```
 
 ## Setup
@@ -113,5 +114,7 @@ Share both databases with the Notion integration under Notion → database menu 
 
 If Notion returns `object_not_found`, the integration probably does not have access or the database ID is wrong.
 
-`POSTS_DATABASE_ID` is retained as configuration metadata but is not used as a
-data-source ID. Post lookup uses `GET /v1/pages/{postId}` directly.
+`POSTS_DATABASE_ID` and `POSTS_DATA_SOURCE_ID` are confirmed configuration for
+future scheduled scanning. Manual Post lookup uses `GET /v1/pages/{postId}`
+directly, so neither variable is required by `GET /post/:id` or
+`POST /from-post`.
