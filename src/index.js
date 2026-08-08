@@ -618,7 +618,14 @@ export function buildPostAssets(fields) {
   const thumbnailExtraction = extractStableFieldUrls(fields.thumbnail);
   const seen = new Set();
   const assets = [];
-  let skipped = imageExtraction.skipped + thumbnailExtraction.skipped;
+  const rejected = new Set([
+    ...imageExtraction.rejected,
+    ...thumbnailExtraction.rejected,
+  ]);
+  let skipped =
+    rejected.size +
+    imageExtraction.duplicateCount +
+    thumbnailExtraction.duplicateCount;
 
   for (const source of imageExtraction.urls) {
     const { url } = source;
@@ -679,14 +686,16 @@ function extractStableFieldUrls(field) {
       : []);
   const urls = [];
   const seen = new Set();
-  let skipped = 0;
+  const rejected = new Set();
+  let duplicateCount = 0;
 
   for (const source of sources) {
     const extraction = extractStableAssetUrlsWithStats(source.value);
-    skipped += extraction.skipped;
+    duplicateCount += extraction.duplicateCount;
+    for (const candidate of extraction.rejected) rejected.add(candidate);
     for (const url of extraction.urls) {
       if (seen.has(url)) {
-        skipped += 1;
+        duplicateCount += 1;
         continue;
       }
       seen.add(url);
@@ -694,7 +703,7 @@ function extractStableFieldUrls(field) {
     }
   }
 
-  return { urls, skipped };
+  return { urls, rejected, duplicateCount };
 }
 
 function describePostAsset({
@@ -898,7 +907,7 @@ function propertyToSimpleValue(property) {
         : null;
     case "files":
       return (property.files || [])
-        .map((file) => file.external?.url)
+        .map((file) => file.external?.url || file.file?.url)
         .filter(Boolean);
     case "relation":
       return (property.relation || []).map((item) => item.id);
@@ -957,23 +966,32 @@ function extractStableAssetUrlsWithStats(value) {
   collectUrlCandidates(value, candidates);
   const urls = [];
   const seen = new Set();
-  let skipped = 0;
+  const rejected = new Set();
+  let duplicateCount = 0;
 
   for (const candidate of candidates) {
-    const normalized = normalizeStableAssetUrl(candidate);
+    const cleaned = stripTrailingUrlPunctuation(candidate);
+    const normalized = normalizeStableAssetUrl(cleaned);
     if (!normalized) {
-      skipped += 1;
+      if (!rejected.has(cleaned)) {
+        rejected.add(cleaned);
+      }
       continue;
     }
     if (seen.has(normalized)) {
-      skipped += 1;
+      duplicateCount += 1;
       continue;
     }
     seen.add(normalized);
     urls.push(normalized);
   }
 
-  return { urls, skipped };
+  return {
+    urls,
+    rejected,
+    duplicateCount,
+    skipped: rejected.size + duplicateCount,
+  };
 }
 
 function collectUrlCandidates(value, output) {
@@ -985,9 +1003,36 @@ function collectUrlCandidates(value, output) {
   const text = cleanString(value);
   if (!text) return;
 
-  for (const match of text.matchAll(/https?:\/\/[^\s,]+/gi)) {
-    output.push(match[0]);
+  for (const match of text.matchAll(/https?:\/\/\S+/gi)) {
+    for (const candidate of match[0].split(/,(?=https?:\/\/)/gi)) {
+      output.push(candidate);
+    }
   }
+}
+
+function stripTrailingUrlPunctuation(value) {
+  let candidate = cleanString(value);
+  let previous;
+
+  do {
+    previous = candidate;
+    candidate = candidate.replace(/[.,;:!?]+$/u, "");
+
+    const closing = candidate.at(-1);
+    const opening = { ")": "(", "]": "[", "}": "{" }[closing];
+    if (
+      opening &&
+      countCharacter(candidate, closing) > countCharacter(candidate, opening)
+    ) {
+      candidate = candidate.slice(0, -1);
+    }
+  } while (candidate !== previous);
+
+  return candidate;
+}
+
+function countCharacter(value, character) {
+  return [...value].filter((item) => item === character).length;
 }
 
 function normalizeStableAssetUrl(value) {

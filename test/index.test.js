@@ -128,6 +128,23 @@ test("parses whitespace and comma-separated values, normalizes, and rejects temp
   ]);
 });
 
+test("strips prose punctuation while preserving query syntax and balanced delimiters", () => {
+  const urls = extractStableAssetUrls(
+    "Use https://assets.example.com/photo.jpg. " +
+      "Then (https://assets.example.com/crop_(final).png). " +
+      "Keep https://assets.example.com/download?next=%2Fmedia%3Fid%3D1&tags=a,b! " +
+      "Also https://assets.example.com/one.jpg,https://assets.example.com/two.jpg;"
+  );
+
+  assert.deepEqual(urls, [
+    "https://assets.example.com/photo.jpg",
+    "https://assets.example.com/crop_(final).png",
+    "https://assets.example.com/download?next=%2Fmedia%3Fid%3D1&tags=a,b",
+    "https://assets.example.com/one.jpg",
+    "https://assets.example.com/two.jpg",
+  ]);
+});
+
 test("deduplicates a thumbnail already present in image URLs", () => {
   const qualification = qualifyPostFields({
     headline: { value: "Duplicate thumbnail" },
@@ -444,6 +461,13 @@ test("temporary-only Posts remain unqualified", () => {
               expiry_time: "2026-08-08T08:00:00.000Z",
             },
           },
+          {
+            type: "file",
+            file: {
+              url: "https://prod-files-secure.s3.us-west-2.amazonaws.com/signed",
+              expiry_time: "2026-08-08T08:00:00.000Z",
+            },
+          },
         ],
       },
       "Thumbnail URL": {
@@ -453,10 +477,49 @@ test("temporary-only Posts remain unqualified", () => {
     },
   });
 
-  assert.deepEqual(post.fields.imageUrl.value, []);
+  assert.deepEqual(post.fields.imageUrl.value, [
+    "https://prod-files-secure.s3.us-west-2.amazonaws.com/signed",
+    "https://prod-files-secure.s3.us-west-2.amazonaws.com/signed",
+  ]);
   assert.equal(post.assets.length, 0);
   assert.equal(post.qualification.qualified, false);
-  assert.equal(post.qualification.skipped, 1);
+  assert.equal(post.qualification.skipped, 2);
+});
+
+test("files preserve stable and temporary candidates with unique rejection counts", () => {
+  const temporary =
+    "https://prod-files-secure.s3.us-west-2.amazonaws.com/notion-signed";
+  const post = simplifyPostPage({
+    id: POST_ID,
+    properties: {
+      Images: {
+        type: "files",
+        files: [
+          {
+            type: "external",
+            external: { url: "https://assets.example.com/stable.png" },
+          },
+          {
+            type: "file",
+            file: { url: temporary },
+          },
+        ],
+      },
+      "Image URL": {
+        type: "url",
+        url: temporary,
+      },
+      "Thumbnail URL": {
+        type: "url",
+        url: "https://secure.notion-static.com/other-temporary.jpg",
+      },
+    },
+  });
+
+  assert.deepEqual(post.assets.map((asset) => asset.url), [
+    "https://assets.example.com/stable.png",
+  ]);
+  assert.equal(post.qualification.skipped, 2);
 });
 
 function destinationSchema() {

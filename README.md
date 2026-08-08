@@ -132,7 +132,9 @@ Deduplication always includes exact `Cloudflare URL` equality. When Media Assets
 has a `Source Post` relation, the query requires both that relation and the
 exact URL; a relation match alone never suppresses another asset. Without the
 relation, exact URL is the fallback. The Media Assets schema is cached briefly
-by each Worker isolate.
+by each Worker isolate. This query-then-create deduplication is best effort:
+simultaneous requests for the same Post and URL can still race. Durable Object
+serialization or another atomic idempotency mechanism is intentionally deferred.
 
 All endpoints except `GET /health` require
 `Authorization: Bearer YOUR_WORKER_API_KEY`.
