@@ -1,14 +1,20 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 
 import worker, {
+  buildCanonicalMediaAssetUpdateProperties,
   buildExistingMediaAssetFilter,
   buildFromPostMediaAssetPayload,
   buildPostAssets,
+  buildSourcePostRelationUpdate,
+  decideMediaAssetRowAction,
   extractStableAssetUrls,
   qualifyPostFields,
   simplifyPostPage,
 } from "../src/index.js";
+import { CANONICAL_R2_ORIGIN } from "../src/media-ingestion.js";
+import { MemoryR2Bucket } from "./helpers/memory-r2.js";
 
 const POST_ID = "3068d902-271f-810e-82e8-f878238d58dd";
 
@@ -176,7 +182,7 @@ test("adds a unique thumbnail as a Cover with an explicit label", () => {
     },
     thumbnail: {
       propertyName: "Thumbnail",
-      value: "https://pub-example.r2.dev/launch-thumb.jpg",
+      value: "https://assets.example.com/launch-thumb.jpg",
     },
   });
   const thumbnail = result.assets[1];
@@ -218,18 +224,27 @@ test("builds schema-compatible properties for each asset", () => {
       needsMedia: { value: true },
     },
   };
-  const thumbnail = buildPostAssets({
-    headline: post.fields.headline,
-    imageUrl: null,
-    thumbnail: {
-      propertyName: "Thumbnail URL",
-      value: "https://pub-example.r2.dev/launch.jpg",
-    },
-  }).assets[0];
+  const thumbnail = {
+    ...buildPostAssets({
+      headline: post.fields.headline,
+      imageUrl: null,
+      thumbnail: {
+        propertyName: "Thumbnail URL",
+        value: "https://assets.example.com/launch.jpg",
+      },
+    }).assets[0],
+    url: `${CANONICAL_R2_ORIGIN}/images/sha256/ab/ab/${"ab".repeat(32)}.jpg`,
+    path: `/images/sha256/ab/ab/${"ab".repeat(32)}.jpg`,
+    filename: `${"ab".repeat(32)}.jpg`,
+    r2Stored: true,
+  };
   const schema = destinationSchema();
 
   const payload = buildFromPostMediaAssetPayload(
-    { MEDIA_ASSETS_DATA_SOURCE_ID: "media-assets-source" },
+    {
+      MEDIA_ASSETS_DATA_SOURCE_ID: "media-assets-source",
+      R2_PUBLIC_BASE_URL: CANONICAL_R2_ORIGIN,
+    },
     post,
     schema,
     thumbnail
@@ -300,22 +315,100 @@ test("dedupe filter always includes exact URL and optionally Source Post", () =>
   assert.equal(withoutUrl, null);
 });
 
-test("POST /from-post returns aggregate results for existing and created URLs", async () => {
+test("row decisions prefer canonical rows and legacy updates only managed fields", () => {
+  const canonicalRow = { id: "canonical" };
+  const legacyRow = { id: "legacy" };
+  assert.deepEqual(
+    decideMediaAssetRowAction({ canonicalRow, legacyRow }),
+    { action: "existing", page: canonicalRow }
+  );
+  assert.deepEqual(
+    decideMediaAssetRowAction({ canonicalRow: null, legacyRow }),
+    { action: "update", page: legacyRow }
+  );
+  assert.deepEqual(
+    decideMediaAssetRowAction({ canonicalRow: null, legacyRow: null }),
+    { action: "create", page: null }
+  );
+
+  const properties = buildCanonicalMediaAssetUpdateProperties(
+    destinationSchema(),
+    {
+      url: `${CANONICAL_R2_ORIGIN}/images/sha256/ab/ab/${"ab".repeat(
+        32
+      )}.webp`,
+      path: `/images/sha256/ab/ab/${"ab".repeat(32)}.webp`,
+      filename: `${"ab".repeat(32)}.webp`,
+      format: null,
+      assetType: "Image",
+      r2Stored: true,
+    }
+  );
+  assert.equal(properties.Format, undefined);
+  assert.equal(properties.Notes, undefined);
+  assert.equal(properties.Name, undefined);
+  assert.deepEqual(properties["Asset Status"], {
+    status: { name: "Uploaded to Cloudflare" },
+  });
+  assert.deepEqual(properties["Product Lane"], {
+    select: { name: "Rednote post" },
+  });
+
+  assert.deepEqual(
+    buildSourcePostRelationUpdate(
+      destinationSchema(),
+      {
+        properties: {
+          "Source Post": {
+            relation: [{ id: "another-post" }],
+            has_more: false,
+          },
+        },
+      },
+      POST_ID
+    ),
+    {
+      "Source Post": {
+        relation: [{ id: "another-post" }, { id: POST_ID }],
+      },
+    }
+  );
+});
+
+test("POST /from-post ingests to R2, updates a legacy row, and reuses canonical rows", async () => {
   const originalFetch = globalThis.fetch;
   const queryBodies = [];
   const createBodies = [];
+  const updateBodies = [];
+  const bucket = new MemoryR2Bucket();
+  const imageBytes = Uint8Array.from([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1,
+  ]);
+  const videoBytes = isoBaseMedia("isom");
+  const imageUrl = canonicalUrlForBytes(imageBytes, "images", "png");
+  const videoUrl = canonicalUrlForBytes(videoBytes, "videos", "mp4");
   const existingRows = new Map([
     [
       "https://assets.example.com/a.png",
       {
-        id: "existing-row",
-        url: "https://www.notion.so/existing-row",
+        id: "legacy-row",
+        url: "https://www.notion.so/legacy-row",
       },
     ],
   ]);
 
   globalThis.fetch = async (url, init = {}) => {
-    const path = new URL(url).pathname;
+    const parsedUrl = new URL(url);
+    const path = parsedUrl.pathname;
+    if (parsedUrl.hostname === "assets.example.com") {
+      if (path === "/a.png") {
+        return mediaResponse(imageBytes, "image/png");
+      }
+      if (path === "/b.mov") {
+        return mediaResponse(videoBytes, "video/mp4");
+      }
+      throw new Error(`Unexpected source request: ${path}`);
+    }
     if (path === `/v1/pages/${POST_ID}`) {
       return notionResponse({
         id: POST_ID,
@@ -339,10 +432,22 @@ test("POST /from-post returns aggregate results for existing and created URLs", 
     if (path.endsWith("/query")) {
       const body = JSON.parse(init.body);
       queryBodies.push(body);
-      const assetUrl = body.filter.and[1].url.equals;
+      const assetUrl = body.filter.and
+        ? body.filter.and[1].url.equals
+        : body.filter.url.equals;
       return notionResponse({
         results: existingRows.has(assetUrl) ? [existingRows.get(assetUrl)] : [],
       });
+    }
+    if (path === "/v1/pages/legacy-row" && init.method === "PATCH") {
+      const body = JSON.parse(init.body);
+      updateBodies.push(body);
+      const page = {
+        id: "legacy-row",
+        url: "https://www.notion.so/legacy-row",
+      };
+      existingRows.set(body.properties["Cloudflare URL"].url, page);
+      return notionResponse(page);
     }
     if (path === "/v1/pages" && init.method === "POST") {
       const body = JSON.parse(init.body);
@@ -372,6 +477,8 @@ test("POST /from-post returns aggregate results for existing and created URLs", 
           NOTION_TOKEN: "test-token",
           WORKER_API_KEY: "test-key",
           MEDIA_ASSETS_DATA_SOURCE_ID: "aggregate-test-source",
+          MEDIA_BUCKET: bucket,
+          R2_PUBLIC_BASE_URL: CANONICAL_R2_ORIGIN,
         }
       );
     const response = await callFromPost();
@@ -381,32 +488,50 @@ test("POST /from-post returns aggregate results for existing and created URLs", 
     assert.deepEqual(
       {
         ok: body.ok,
+        sourceAssets: body.sourceAssets,
         totalAssets: body.totalAssets,
         created: body.created,
+        updated: body.updated,
         existing: body.existing,
+        deduplicated: body.deduplicated,
         skipped: body.skipped,
       },
-      { ok: true, totalAssets: 2, created: 1, existing: 1, skipped: 0 }
+      {
+        ok: true,
+        sourceAssets: 2,
+        totalAssets: 2,
+        created: 1,
+        updated: 1,
+        existing: 0,
+        deduplicated: 0,
+        skipped: 0,
+      }
     );
     assert.deepEqual(
       body.results.map((result) => ({
+        sourceUrl: result.sourceUrl,
         url: result.url,
-        created: result.created,
+        r2Action: result.r2Action,
+        notionAction: result.notionAction,
         id: result.id,
         sourceKind: result.sourceKind,
         sourceIndex: result.sourceIndex,
       })),
       [
         {
-          url: "https://assets.example.com/a.png",
-          created: false,
-          id: "existing-row",
+          sourceUrl: "https://assets.example.com/a.png",
+          url: imageUrl,
+          r2Action: "uploaded",
+          notionAction: "updated",
+          id: "legacy-row",
           sourceKind: "image",
           sourceIndex: 1,
         },
         {
-          url: "https://assets.example.com/b.mov",
-          created: true,
+          sourceUrl: "https://assets.example.com/b.mov",
+          url: videoUrl,
+          r2Action: "uploaded",
+          notionAction: "created",
           id: "created-row",
           sourceKind: "image",
           sourceIndex: 2,
@@ -420,27 +545,157 @@ test("POST /from-post returns aggregate results for existing and created URLs", 
       {
         totalAssets: repeatBody.totalAssets,
         created: repeatBody.created,
+        updated: repeatBody.updated,
         existing: repeatBody.existing,
       },
-      { totalAssets: 2, created: 0, existing: 2 }
+      { totalAssets: 2, created: 0, updated: 0, existing: 2 }
     );
     assert.deepEqual(
-      repeatBody.results.map((result) => result.created),
-      [false, false]
+      repeatBody.results.map((result) => ({
+        r2Action: result.r2Action,
+        notionAction: result.notionAction,
+      })),
+      [
+        { r2Action: "reused", notionAction: "existing" },
+        { r2Action: "reused", notionAction: "existing" },
+      ]
     );
-    assert.equal(queryBodies.length, 4);
+    assert.equal(queryBodies.length, 6);
     assert.equal(
       queryBodies[1].filter.and[1].url.equals,
-      "https://assets.example.com/b.mov"
+      "https://assets.example.com/a.png"
     );
     assert.equal(createBodies.length, 1);
     assert.deepEqual(createBodies[0].properties["Asset Type"], {
       select: { name: "Video" },
     });
-    assert.equal(createBodies[0].properties.Format, undefined);
+    assert.deepEqual(createBodies[0].properties.Format, {
+      select: { name: "MP4" },
+    });
+    assert.equal(updateBodies.length, 1);
+    assert.equal(
+      updateBodies[0].properties["Cloudflare URL"].url,
+      imageUrl
+    );
+    assert.equal(updateBodies[0].properties.Notes, undefined);
+    assert.deepEqual(updateBodies[0].properties["Storage Status"], {
+      select: { name: "Uploaded to Cloudflare" },
+    });
+    assert.deepEqual(bucket.stagingKeys(), []);
+    assert.deepEqual(new Set(bucket.putKeys), new Set([
+      imageUrl.slice(`${CANONICAL_R2_ORIGIN}/`.length),
+      videoUrl.slice(`${CANONICAL_R2_ORIGIN}/`.length),
+    ]));
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("POST /ingest-url stores media without creating a Notion row", async () => {
+  const originalFetch = globalThis.fetch;
+  const bucket = new MemoryR2Bucket();
+  const bytes = Uint8Array.from([
+    0xff, 0xd8, 0xff, 0xdb, 0x00, 0x43, 0x01,
+  ]);
+  let sourceRequests = 0;
+  globalThis.fetch = async (url) => {
+    const parsed = new URL(url);
+    if (parsed.hostname === "assets.example.com") {
+      sourceRequests += 1;
+      return mediaResponse(bytes, "image/jpeg");
+    }
+    throw new Error("POST /ingest-url must not call Notion.");
+  };
+
+  try {
+    const response = await worker.fetch(
+      new Request("https://worker.example/ingest-url", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer test-key",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          sourceUrl: "https://assets.example.com/focused-test",
+          kind: "image",
+        }),
+      }),
+      {
+        NOTION_TOKEN: "test-token",
+        WORKER_API_KEY: "test-key",
+        MEDIA_ASSETS_DATA_SOURCE_ID: "media-assets-source",
+        MEDIA_BUCKET: bucket,
+        R2_PUBLIC_BASE_URL: CANONICAL_R2_ORIGIN,
+      }
+    );
+    const body = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.equal(body.ok, true);
+    assert.equal(body.result.sourceUrl, "https://assets.example.com/focused-test");
+    assert.equal(body.result.r2Action, "uploaded");
+    assert.equal(body.result.extension, "jpg");
+    assert.equal(sourceRequests, 1);
+    assert.deepEqual(bucket.stagingKeys(), []);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("GET /health is authenticated and reports R2 readiness without details", async () => {
+  const env = {
+    NOTION_TOKEN: "test-token",
+    WORKER_API_KEY: "test-key",
+    MEDIA_ASSETS_DATA_SOURCE_ID: "media-assets-source",
+    MEDIA_BUCKET: new MemoryR2Bucket(),
+    R2_PUBLIC_BASE_URL: CANONICAL_R2_ORIGIN,
+  };
+  const unauthorized = await worker.fetch(
+    new Request("https://worker.example/health"),
+    env
+  );
+  const authorized = await worker.fetch(
+    new Request("https://worker.example/health", {
+      headers: { Authorization: "Bearer test-key" },
+    }),
+    env
+  );
+  const body = await authorized.json();
+
+  assert.equal(unauthorized.status, 401);
+  assert.equal(authorized.status, 200);
+  assert.deepEqual(body, {
+    ok: true,
+    service: "media-assets-worker",
+    r2Configured: true,
+  });
+});
+
+test("metadata-only POST /media-assets cannot claim an R2 upload", async () => {
+  const response = await worker.fetch(
+    new Request("https://worker.example/media-assets", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer test-key",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        name: "Unsafe metadata claim",
+        storageStatus: "Uploaded to Cloudflare",
+      }),
+    }),
+    {
+      NOTION_TOKEN: "test-token",
+      WORKER_API_KEY: "test-key",
+      MEDIA_ASSETS_DATA_SOURCE_ID: "media-assets-source",
+      MEDIA_BUCKET: new MemoryR2Bucket(),
+      R2_PUBLIC_BASE_URL: CANONICAL_R2_ORIGIN,
+    }
+  );
+  const body = await response.json();
+
+  assert.equal(response.status, 400);
+  assert.match(body.error, /metadata-only/);
 });
 
 test("temporary-only Posts remain unqualified", () => {
@@ -573,4 +828,31 @@ function notionResponse(value, status = 200) {
     status,
     headers: { "Content-Type": "application/json" },
   });
+}
+
+function mediaResponse(bytes, contentType) {
+  return new Response(bytes, {
+    status: 200,
+    headers: {
+      "Content-Type": contentType,
+      "Content-Length": String(bytes.byteLength),
+    },
+  });
+}
+
+function canonicalUrlForBytes(bytes, directory, extension) {
+  const hash = createHash("sha256").update(bytes).digest("hex");
+  return `${CANONICAL_R2_ORIGIN}/${directory}/sha256/${hash.slice(
+    0,
+    2
+  )}/${hash.slice(2, 4)}/${hash}.${extension}`;
+}
+
+function isoBaseMedia(brand) {
+  const bytes = new Uint8Array(24);
+  bytes.set([0, 0, 0, 24], 0);
+  bytes.set(new TextEncoder().encode("ftyp"), 4);
+  bytes.set(new TextEncoder().encode(brand), 8);
+  bytes.set(new TextEncoder().encode(brand), 16);
+  return bytes;
 }

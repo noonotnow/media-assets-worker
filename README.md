@@ -1,150 +1,310 @@
 # Media Assets Worker
 
-Phase 1.5 Cloudflare Worker for creating rows in Katie's Notion Media Assets
-database, including manual Post → Media Asset mapping.
+Cloudflare Worker that ingests stable Post media into R2 and then registers the
+canonical R2 object in Notion Media Assets. R2 is the source of truth; source
+URLs are provenance, not the stored asset URL.
 
-R2 upload, R2 restoration, scheduled Post scans, and file fallback are
-intentionally deferred. The scheduled scan will be added after manual mapping
-has been proven against real Post rows.
+Scheduled Post scanning remains deferred. This phase handles authenticated
+manual Post ingestion and focused URL ingestion only.
 
-## IDs
+## Architecture
+
+`POST /from-post` performs a two-phase import:
+
+1. Read the Notion Post and extract stable URLs from all supported image and
+   thumbnail aliases.
+2. Skip temporary Notion-hosted signed file URLs and duplicate normalized
+   source URLs.
+3. For an exact canonical URL, validate the canonical key and `HEAD` it in R2.
+   Missing objects are rejected; canonical-looking URLs are never trusted on
+   shape alone.
+4. For any other source, fetch public HTTPS only, follow at most five manually
+   validated redirects, and stream into `imports/staging/<upload-id>`.
+5. Inspect leading bytes, validate MIME compatibility, enforce byte limits,
+   and incrementally calculate SHA-256 while uploading 16 MiB multipart parts.
+6. Derive the content-addressed key. Reuse a compatible existing canonical
+   object or stream-copy the completed staging object to that key.
+7. Set immutable cache metadata and R2 custom metadata, then delete staging.
+8. After all source assets ingest successfully, query/update/create Notion
+   rows using canonical URL/path values.
+
+The Worker never reads, deletes, resumes, or otherwise changes existing
+`videos/staging/` objects. Those stuck multipart uploads require a separate,
+explicit cleanup decision.
+
+## Canonical storage
+
+Bucket and public origin:
 
 ```txt
-MEDIA_ASSETS_DATABASE_ID=7c86b4f3-1f36-4f82-96d8-1fe87962fcc0
-MEDIA_ASSETS_DATA_SOURCE_ID=97d14043-3d6b-46db-959b-d8a8d55feee3
-POSTS_DATABASE_ID=3068d902-271f-810e-82e8-f878238d58dd
-POSTS_DATA_SOURCE_ID=3068d902-271f-8111-89ac-000bbaa74214
+R2 bucket: xhs-images
+Public origin: https://images.xhs.justlikekatie.com
 ```
 
-## Setup
+Canonical keys:
+
+```txt
+images/sha256/<hash[0:2]>/<hash[2:4]>/<sha256>.<canonical-ext>
+videos/sha256/<hash[0:2]>/<hash[2:4]>/<sha256>.<canonical-ext>
+```
+
+JPEG is always stored with `.jpg`. Safely identified PNG, WebP, GIF, MP4,
+QuickTime/MOV, and WebM containers retain their canonical extension. Notion
+Format is written only when the destination schema already offers the matching
+option:
+
+| Detected bytes | Canonical extension | Notion Format |
+| --- | --- | --- |
+| JPEG | `.jpg` | `JPG` |
+| PNG | `.png` | `PNG` |
+| WebP | `.webp` | omitted |
+| GIF | `.gif` | omitted |
+| MP4 | `.mp4` | `MP4` |
+| QuickTime | `.mov` | omitted |
+| WebM | `.webm` | omitted |
+
+Canonical writes use:
+
+```txt
+Cache-Control: public, max-age=31536000, immutable
+```
+
+Custom metadata includes SHA-256 and upload ID, plus Source Post ID when
+available. Source URL metadata omits the query string and is included only
+when the result fits the conservative metadata size cap.
+
+## Configuration
+
+`wrangler.toml` uses the native binding. Do not add R2 access keys:
+
+```toml
+compatibility_flags = ["global_fetch_strictly_public"]
+
+[vars]
+R2_PUBLIC_BASE_URL = "https://images.xhs.justlikekatie.com"
+
+[[r2_buckets]]
+binding = "MEDIA_BUCKET"
+bucket_name = "xhs-images"
+```
+
+The strict-public fetch compatibility flag forces user-controlled source
+requests through Cloudflare's public front door instead of allowing global
+`fetch()` to bypass edge controls for a Worker-owned zone.
+
+Required secrets remain:
 
 ```bash
-npm install
 wrangler secret put NOTION_TOKEN
 wrangler secret put WORKER_API_KEY
-npm run dev
 ```
 
-## Deploy
+The confirmed Notion database/data source IDs and the R2 public base URL are
+non-secret Wrangler variables. Share both Notion databases with the Notion
+integration under **Connections**.
 
-```bash
-npm run deploy
+## Source security model
+
+Every initial and redirect URL is validated independently:
+
+- HTTPS only, with no username/password or fragment.
+- Port must be omitted or 443.
+- `localhost`, `.localhost`, `.local`, known metadata hostnames, private,
+  loopback, link-local, unspecified, multicast, reserved, and cloud metadata
+  IPv4/IPv6 literals are rejected.
+- Redirects are manual and limited to five hops.
+- Source requests use only a fixed `User-Agent` and `Accept`; caller cookies,
+  authorization, referrer, and other headers are never forwarded.
+- Connection/header wait is capped at 30 seconds. Stream inactivity is capped
+  at 30 seconds and total source streaming at 30 minutes.
+- `Content-Length` is checked when present, and streamed bytes are counted
+  independently when absent or inaccurate.
+- Media type comes from bounded leading-byte inspection. HTML/error responses,
+  unsupported containers, and MIME/signature disagreements are rejected.
+
+This materially reduces SSRF exposure but does **not** eliminate DNS rebinding:
+Workers cannot resolve and pin a hostname to a vetted address for the complete
+outbound request. Only use this endpoint as an authenticated production
+boundary, monitor source failures, and do not describe the policy as complete
+SSRF prevention.
+
+Temporary Notion file URLs remain unqualified. A Post needs a deliberate,
+stable public HTTPS source before it can be ingested.
+
+## Limits and runtime considerations
+
+| Media kind | Maximum source size |
+| --- | ---: |
+| Image | 25 MiB |
+| Video | 1 GiB |
+
+The 1 GiB application limit is below R2 multipart limits (5 MiB minimum part
+except the final part, 10,000 parts, and multi-terabyte objects). The Worker
+uses 16 MiB parts and stays below the 128 MB isolate memory limit by never
+buffering a full video.
+
+Incremental SHA-256 is CPU work. Cloudflare Workers Free allows only 10 ms CPU
+per request and is not suitable for this ingestion flow. Workers Paid defaults
+to 30 seconds CPU and can be configured up to 300,000 ms:
+
+```toml
+[limits]
+cpu_ms = 300_000
 ```
 
-## Test endpoints
+Do not add that override blindly: confirm the account is on Workers Paid and
+use Worker CPU metrics with representative large videos first. HTTP Workers
+have no fixed wall-clock limit while the client remains connected, but a
+disconnect can cancel the request. A 1 GiB transfer therefore remains
+dependent on source throughput, client connection lifetime, CPU allowance, and
+Cloudflare runtime updates. R2 also rate-limits concurrent writes to the same
+key; a failed canonical write is reconciled with a compatible `HEAD` so an
+identical concurrent winner can be reused.
 
-Health check:
+## Notion behavior
 
-```bash
-curl https://YOUR-WORKER.workers.dev/health
+The Post source aliases remain:
+
+- Images: `Image URLs`, `Images URL`, `Image URL`, `Images`
+- Thumbnails: `Thumbnail`, `Thumbnail URL`
+
+Rich text may contain newline-, whitespace-, or comma-separated URLs. A unique
+thumbnail becomes Asset Type `Cover` with Canonical Label `Thumbnail`. Other
+detected images/videos become one row per canonical object. Different source
+URLs with identical bytes collapse to one canonical row/result and appear in
+the response `duplicates` array with reason `duplicate-content`.
+
+After R2 success:
+
+- Query exact canonical Cloudflare URL first.
+- If it exists, return it and append the current Source Post relation when that
+  can be done without replacing existing relations.
+- Otherwise query Source Post + original source URL. A legacy row is updated
+  only in Cloudflare URL, Cloudflare Path, Filename, supported Format, Asset
+  Type, Storage Status, Asset Status, and Product Lane.
+- Otherwise create a new schema-compatible row.
+
+Human notes and unrelated metadata are not replaced during legacy migration.
+`Uploaded to Cloudflare` is written only after successful R2 validation and
+only when the destination option already exists.
+
+Notion dedupe remains a best-effort query-then-create operation. Concurrent
+requests can still create duplicate Notion rows; Durable Object serialization
+is intentionally deferred for this phase. R2 writes are content-addressed, so
+concurrent writes for an identical hash/key contain identical bytes.
+
+## Endpoints
+
+Every endpoint, including health, requires:
+
+```txt
+Authorization: Bearer <WORKER_API_KEY>
 ```
 
-Create a test media asset:
+| Endpoint | Behavior |
+| --- | --- |
+| `GET /health` | Authenticated service health; reports only that R2 is configured. |
+| `GET /test` | Creates the existing Notion test row. It does not ingest media. |
+| `GET /post/:id` | Shows simplified Post fields and qualified source assets. |
+| `POST /media-assets` | Metadata-only Notion creation. It does not download or ingest a URL and cannot mark a row Uploaded to Cloudflare. |
+| `POST /from-post` | Ingests all qualified Post assets to R2, then reconciles Notion rows. |
+| `POST /ingest-url` | Ingests one URL to R2 for focused testing; never creates a Notion row. |
+
+### Focused URL ingestion
 
 ```bash
-curl https://YOUR-WORKER.workers.dev/test \
-  -H "Authorization: Bearer $WORKER_API_KEY"
-```
-
-Create a custom media asset:
-
-```bash
-curl -X POST https://YOUR-WORKER.workers.dev/media-assets \
+curl -X POST "$WORKER_URL/ingest-url" \
   -H "Authorization: Bearer $WORKER_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{
-    "name": "Day 8 cover",
-    "assetType": "Cover",
-    "format": "PNG",
-    "series": "念无双 第二季等待室",
-    "productLane": "Rednote freebie",
-    "textStatus": "Day text",
-    "notes": "Created from worker upload."
+  --data '{
+    "sourceUrl": "https://public.example/media/photo.jpg",
+    "kind": "image"
   }'
 ```
 
-Inspect the source fields used for mapping a Post:
+`kind` is optional and may be `image` or `video`. `postId` is optional and, when
+present, must be a Notion page UUID. Unknown request fields are rejected.
 
-```bash
-curl https://YOUR-WORKER.workers.dev/post/NOTION_POST_PAGE_UUID \
-  -H "Authorization: Bearer YOUR_WORKER_API_KEY"
-```
-
-Create or find every Media Asset mapped from a Post:
-
-```bash
-curl -X POST https://YOUR-WORKER.workers.dev/from-post \
-  -H "Authorization: Bearer YOUR_WORKER_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"postId":"NOTION_POST_PAGE_UUID"}'
-```
-
-The response aggregates all qualified source URLs:
+Representative result:
 
 ```json
 {
   "ok": true,
-  "totalAssets": 3,
-  "created": 2,
-  "existing": 1,
-  "skipped": 1,
-  "results": [
-    {
-      "url": "https://pub-example.r2.dev/day-4/photo.jpg",
-      "created": false,
-      "id": "existing-notion-row-id",
-      "rowUrl": "https://www.notion.so/existing-notion-row-id",
-      "sourceKind": "image",
-      "sourceIndex": 1
-    }
-  ]
+  "result": {
+    "sourceUrl": "https://public.example/media/photo.jpg",
+    "url": "https://images.xhs.justlikekatie.com/images/sha256/ab/cd/abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.jpg",
+    "cloudflarePath": "/images/sha256/ab/cd/abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.jpg",
+    "r2Action": "uploaded",
+    "r2Reused": false,
+    "r2Uploaded": true
+  }
 }
 ```
 
-`skipped` counts rejected temporary URLs and duplicate normalized URLs. A
-request with no stable qualifying URLs returns a meaningful `409` response.
+### Post ingestion
 
-## Post qualification and mapping
+```bash
+curl -X POST "$WORKER_URL/from-post" \
+  -H "Authorization: Bearer $WORKER_API_KEY" \
+  -H "Content-Type: application/json" \
+  --data '{"postId":"NOTION_POST_PAGE_UUID"}'
+```
 
-A Post qualifies when any supported image or thumbnail property contains a
-stable external `http://` or `https://` URL. Image aliases are `Image URLs`,
-`Images URL`, `Image URL`, and `Images`; thumbnail aliases are `Thumbnail` and
-`Thumbnail URL`. Rich text may contain newline-, whitespace-, or comma-separated
-URLs. Temporary signed Notion-hosted URLs, R2 identifiers, relative paths,
-malformed URLs, and other protocols do not qualify.
+Each unique result includes `sourceUrl`, canonical `url`, `cloudflarePath`,
+`r2Action`, and `notionAction` (`created`, `updated`, or `existing`). Aggregate
+counts include source assets, canonical assets, created/updated/existing rows,
+deduplicated content, and skipped sources.
 
-Each unique normalized image URL produces one Media Assets row in source order.
-Rows are named `Headline — asset 01`, `Headline — asset 02`, and so on. A
-thumbnail that is not already in the image list produces a separate
-`Headline — thumbnail` row with Asset Type `Cover` and Canonical Label
-`Thumbnail`. Pathname extensions infer Image versus Video; Format is limited to
-existing JPG, PNG, and MP4 options.
+### Metadata-only creation
 
-The URL becomes `Cloudflare URL`; its pathname becomes `Cloudflare Path` and
-provides Filename. The mapper reads Headline/title, Platform, Series, Production
-Mode, Media source, Campaign / event name, campaign requirements, Notes, and
-Needs media. It sets Product Lane to `Rednote post` when that option exists.
-Stable R2/Cloudflare URLs use `Uploaded to Cloudflare` for both storage and
-asset status when those options exist. Other source context is retained in
-Media Asset Notes.
+```bash
+curl -X POST "$WORKER_URL/media-assets" \
+  -H "Authorization: Bearer $WORKER_API_KEY" \
+  -H "Content-Type: application/json" \
+  --data '{
+    "name": "Manual metadata row",
+    "assetType": "Image",
+    "notes": "No source ingestion is performed by this route."
+  }'
+```
 
-Deduplication always includes exact `Cloudflare URL` equality. When Media Assets
-has a `Source Post` relation, the query requires both that relation and the
-exact URL; a relation match alone never suppresses another asset. Without the
-relation, exact URL is the fallback. The Media Assets schema is cached briefly
-by each Worker isolate. This query-then-create deduplication is best effort:
-simultaneous requests for the same Post and URL can still race. Durable Object
-serialization or another atomic idempotency mechanism is intentionally deferred.
+## Failure semantics
 
-All endpoints except `GET /health` require
-`Authorization: Bearer YOUR_WORKER_API_KEY`.
+- Validation, redirect, MIME, signature, timeout, and byte-limit failures abort
+  multipart upload and delete the staging key.
+- Canonical promotion is verified with `HEAD`; staging is then deleted on both
+  upload and reuse paths.
+- If staging cleanup itself fails, the request returns an explicit error rather
+  than reporting success.
+- `/from-post` ingests all sources before making Notion changes. If a later
+  source fails, earlier canonical R2 objects may remain and are safely reused
+  on retry, but Notion has not yet been changed.
+- If Notion fails after R2 succeeds, the canonical object remains the source of
+  truth and a retry reconciles the row.
+- Errors retain the JSON shape `{ "ok": false, "error": "...", "details": {} }`
+  without returning authorization data or redirect/source query strings.
 
-## Notion requirement
+## Local validation and deployment
 
-Share both databases with the Notion integration under Notion → database menu → Connections.
+```bash
+npm ci
+npm test
+npx wrangler deploy --dry-run
+```
 
-If Notion returns `object_not_found`, the integration probably does not have access or the database ID is wrong.
+Manual production sequence:
 
-`POSTS_DATABASE_ID` and `POSTS_DATA_SOURCE_ID` are groundwork for a later
-scheduled scan. Manual Post lookup uses `GET /v1/pages/{postId}` directly and
-does not require either variable at runtime.
+1. Confirm the `xhs-images` bucket custom domain is exactly
+   `images.xhs.justlikekatie.com`.
+2. Confirm `NOTION_TOKEN` and `WORKER_API_KEY` already exist as Worker secrets.
+3. Run the validation commands above.
+4. Deploy with `npm run deploy`.
+5. Call authenticated `GET /health`.
+6. Call `POST /ingest-url` with a small known public image; confirm the returned
+   URL uses the canonical custom domain and the staging prefix is empty.
+7. Call `POST /from-post` for a test Post and confirm Notion stores only the
+   canonical Cloudflare URL/path.
+8. Repeat both calls and confirm R2/Notion actions report reuse/existing.
+
+Do not run any cleanup against `videos/staging/` as part of deployment or
+verification.
