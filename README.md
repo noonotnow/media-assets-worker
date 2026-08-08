@@ -181,20 +181,23 @@ memory.
 
 Incremental SHA-256 is CPU work. Cloudflare Workers Free allows only 10 ms CPU
 per request and is not suitable for this ingestion flow. Workers Paid defaults
-to 30 seconds CPU and can be configured up to 300,000 ms:
+to 30 seconds CPU per request; this Worker now configures the paid-plan maximum
+of 300,000 ms (5 minutes):
 
 ```toml
 [limits]
 cpu_ms = 300_000
 ```
 
-Do not add that override blindly: confirm the account is on Workers Paid and
-use Worker CPU metrics with representative large videos first. Workers Free
-also allows only 50 subrequests per invocation, while Workers Paid allows
-10,000. A fresh 1 GiB ingest uses 64 staging parts and 64 destination parts,
-plus source fetch, create/complete, `HEAD`, `GET`, list, and delete operations,
-so it cannot fit the Free subrequest budget. The six simultaneous outgoing
-connection limit is respected because part operations are sequential.
+This higher cap is a trial for hashing large videos, not a guarantee that a
+1 GiB ingest will complete. Confirm the account is on Workers Paid and use
+Worker CPU metrics with representative large videos before treating the limit
+as sufficient. Workers Free also allows only 50 subrequests per invocation,
+while Workers Paid allows 10,000. A fresh 1 GiB ingest uses 64 staging parts and
+64 destination parts, plus source fetch, create/complete, `HEAD`, `GET`, list,
+and delete operations, so it cannot fit the Free subrequest budget. The six
+simultaneous outgoing connection limit is respected because part operations
+are sequential.
 
 HTTP Workers have no fixed wall-clock limit while the client remains connected,
 but a disconnect can cancel the request; runtime updates provide only a
