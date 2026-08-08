@@ -215,18 +215,7 @@ export function resolveAndValidateRedirectUrl(location, currentUrl) {
   }
 
   try {
-    const validated = validatePublicHttpsUrl(resolved.href);
-    if (
-      validated.origin === CANONICAL_R2_ORIGIN &&
-      !parseCanonicalMediaUrl(validated.href)
-    ) {
-      throw new MediaIngestionError(
-        400,
-        "Redirect on the canonical media origin used a noncanonical path.",
-        "INVALID_CANONICAL_URL"
-      );
-    }
-    return validated;
+    return validatePublicHttpsUrl(resolved.href);
   } catch (error) {
     if (error instanceof MediaIngestionError) {
       throw new MediaIngestionError(

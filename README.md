@@ -15,26 +15,30 @@ manual Post ingestion and focused URL ingestion only.
    thumbnail aliases.
 2. Skip temporary Notion-hosted signed file URLs and duplicate normalized
    source URLs.
-3. For an exact canonical URL, validate the canonical key and `HEAD` it in R2.
-   Missing objects are rejected; canonical-looking URLs are never trusted on
-   shape alone.
-4. For any other source, first look for completed retry staging under a
-   source-fingerprint prefix. If none exists, fetch public HTTPS only, follow at
-   most five manually validated redirects, and stream into
+3. For an exact canonical SHA URL, validate the canonical key and `HEAD` it in
+   R2. Missing objects are rejected; canonical-looking URLs are never trusted
+   on shape alone.
+4. For another path on the exact custom origin, validate and decode the legacy
+   key, then read it directly through `MEDIA_BUCKET.get()`. The Worker never
+   sends an outbound HTTP request for a bound-bucket source.
+5. For any source, first look for completed retry staging under a
+   source-fingerprint prefix. If none exists, stream the bound object or fetch
+   public HTTPS with at most five manually validated redirects into
    `imports/staging/src-<source-sha256>-<upload-id>`.
-5. Inspect leading bytes, validate MIME compatibility, enforce byte limits,
+6. Inspect leading bytes, validate MIME compatibility, enforce byte limits,
    and incrementally calculate SHA-256 while uploading 16 MiB multipart parts.
-6. Derive the content-addressed key. Reuse a compatible existing canonical
+7. Derive the content-addressed key. Reuse a compatible existing canonical
    object or stream-copy staging through a second, abortable multipart upload.
    Canonical part uploads have bounded retries.
-7. Set immutable cache metadata and R2 custom metadata, verify the canonical
+8. Set immutable cache metadata and R2 custom metadata, verify the canonical
    object with `HEAD`, and only then delete completed staging.
-8. After all source assets ingest successfully, query/update/create Notion
+9. After all source assets ingest successfully, query/update/create Notion
    rows using canonical URL/path values.
 
-The Worker never reads, deletes, resumes, or otherwise changes existing
-`videos/staging/` objects. Those stuck multipart uploads require a separate,
-explicit cleanup decision.
+An explicitly supplied, completed `videos/staging/` object may be read as a
+legacy source, but it is never deleted, mutated, or resumed. Existing stuck
+multipart uploads are not completed objects and remain untouched; cleanup
+still requires a separate, explicit decision.
 
 ## Canonical storage
 
@@ -130,6 +134,13 @@ Every initial and redirect URL is validated independently:
   independently when absent or inaccurate.
 - Media type comes from bounded leading-byte inspection. HTML/error responses,
   unsupported containers, and MIME/signature disagreements are rejected.
+- Exact custom-origin paths outside the canonical SHA namespaces are treated as
+  legacy bound-bucket sources. Empty, traversal-like, malformed encoded,
+  control-character, backslash, and overlong decoded keys are rejected.
+  `imports/staging/` is always internal and cannot be supplied as a source.
+- A path claiming `images/sha256/` or `videos/sha256/` must be a fully valid
+  canonical key; malformed canonical shards are rejected rather than treated
+  as legacy media.
 
 This materially reduces SSRF exposure but does **not** eliminate DNS rebinding:
 Workers cannot resolve and pin a hostname to a vetted address for the complete
@@ -318,6 +329,9 @@ curl -X POST "$WORKER_URL/media-assets" \
 
 - Validation, redirect, MIME, signature, timeout, byte-limit, and source-stream
   failures abort incomplete staging multipart upload and delete its key.
+- Legacy same-origin source objects are read-only. Cleanup targets only
+  `imports/staging/` retry objects created by this ingestion flow and never the
+  supplied legacy key.
 - Once staging multipart completes, canonical promotion failure returns
   `R2_CANONICAL_PROMOTION_RETRYABLE` with a safe staging key containing only a
   source hash and upload ID. Completed staging is deliberately preserved.
