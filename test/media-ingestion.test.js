@@ -354,6 +354,26 @@ test("requires a complete bounded and aligned ftyp box before ISO detection", ()
     "/videos/assets/capcut.mp4"
   );
   assert.equal(capCutType.mediaType.extension, "mp4");
+  const capCutWithQuickTimeMetadata = resolveValidatedMediaType(
+    detectMediaType(capCut),
+    "video/quicktime",
+    "/videos/assets/capcut.mp4"
+  );
+  assert.equal(capCutWithQuickTimeMetadata.mediaType.extension, "mp4");
+  const actualMov = resolveValidatedMediaType(
+    detectMediaType(capCut),
+    "video/quicktime",
+    "/videos/assets/capcut.mov"
+  );
+  assert.equal(actualMov.mediaType.extension, "mov");
+  assert.throws(
+    () => resolveValidatedMediaType(
+      detectMediaType(capCut),
+      "audio/aac",
+      "/videos/assets/capcut.mp4"
+    ),
+    (error) => error.status === 415
+  );
   assert.equal(detectMediaType(new TextEncoder().encode("not ISO-BMFF")), null);
 });
 
