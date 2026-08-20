@@ -409,9 +409,15 @@ export function resolveValidatedMediaType(
   const normalizedContentType = normalizeContentType(declaredContentType);
   if (
     detectedMediaType === QUICKTIME_MAJOR_MEDIA_TYPE &&
-    normalizedContentType === "video/mp4"
+    sourceExtensionFromPathname(sourcePathname) === "mp4"
   ) {
-    if (sourceExtensionFromPathname(sourcePathname) !== "mp4") {
+    // CapCut can export a valid MP4 with a QuickTime-major ftyp box. The
+    // pathname is part of the evidence: only an explicit .mp4 source may
+    // normalize to MP4, and contradictory non-video metadata still fails.
+    if (
+      normalizedContentType !== "video/mp4" &&
+      normalizedContentType !== "video/quicktime"
+    ) {
       throw mediaTypeMismatchError();
     }
     return {
